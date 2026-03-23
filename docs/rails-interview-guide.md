@@ -17,6 +17,9 @@
 7. [Zeitwerk — The Rails Autoloader](#7-zeitwerk--the-rails-autoloader)
 8. [Routing & Nested Resources](#8-routing--nested-resources)
 9. [Controllers](#9-controllers)
+10. [Views, Partials & Form Helpers](#10-views-partials--form-helpers)
+11. [String Helpers — humanize, pluralize & Inflector](#11-string-helpers--humanize-pluralize--inflector)
+12. [Initializers](#12-initializers)
 
 ---
 
@@ -522,7 +525,268 @@ end
 
 ---
 
-## Quick Reference: Key Rails Commands
+## 10. Views, Partials & Form Helpers
+
+### The partial naming convention
+
+Files prefixed with `_` are **partials** — reusable view fragments. They are never rendered directly; always rendered from another view via `render`.
+
+```
+app/views/issues/_form.html.erb   ← partial (note the underscore)
+app/views/issues/new.html.erb     ← full view, renders the partial
+app/views/issues/edit.html.erb    ← full view, renders the same partial
+```
+
+### Why one `_form` partial for both `new` and `edit`?
+
+Both forms have identical fields — only the URL and HTTP method differ. Rails handles that automatically based on whether the model is persisted or not:
+
+```erb
+<%# new.html.erb %>
+<%= render 'form', issue: @issue, project: @project %>
+
+<%# edit.html.erb %>
+<%= render 'form', issue: @issue, project: @issue.project %>
+```
+
+Variables passed to `render` become local variables inside the partial — `@issue` (instance variable) becomes `issue` (local variable). This makes partials reusable across different contexts.
+
+### The shallow routing problem with `form_with`
+
+With shallow nested routes, `form_with(model: issue)` alone cannot determine the correct URL for a **new** issue — it would try `POST /issues` which doesn't exist. The URL must be explicit:
+
+```erb
+<%= form_with(model: issue, url: issue.new_record? ? project_issues_path(project) : issue_path(issue)) do |form| %>
+```
+
+| Scenario | `new_record?` | URL used |
+| --- | --- | --- |
+| Creating a new issue | `true` | `POST /projects/:project_id/issues` |
+| Editing an existing issue | `false` | `PATCH /issues/:id` |
+
+### `new_record?` — how Rails knows the form action
+
+```ruby
+issue.new_record?   # => true  — not yet saved to DB (no id)
+                    # => false — exists in DB (has id)
+
+# Counterpart:
+issue.persisted?    # => opposite of new_record?
+```
+
+### `local: true` is no longer needed
+
+In **Rails 6.1+**, `form_with` submits via standard HTTP by default. `local: true` used to be required to opt out of Ajax submission — it's now the default. You only need `local: false` to explicitly enable Ajax.
+
+### Building a `<select>` from an enum
+
+```erb
+<%= form.select :status, Issue.statuses.keys.map { |s| [s.humanize, s] }, { include_blank: false } %>
+```
+
+`form.select` expects `[label_to_display, value_to_submit]` pairs:
+
+```ruby
+Issue.statuses                               # => { "open" => 0, "in_progress" => 1, "closed" => 2 }
+Issue.statuses.keys                          # => ["open", "in_progress", "closed"]
+Issue.statuses.keys.map { |s| [s.humanize, s] }
+# => [["Open", "open"], ["In progress", "in_progress"], ["Closed", "closed"]]
+```
+
+If you add a new status to the enum, the dropdown updates automatically — no hardcoded strings in the view.
+
+### Navigating to the project from a shallow edit route
+
+In the `edit` action, only `@issue` is loaded (no `@project`) because it's a shallow route. Navigate through the association:
+
+```erb
+<%# edit.html.erb — @project is not set, so use the association %>
+<%= render 'form', issue: @issue, project: @issue.project %>
+```
+
+### Accessing `edit` via `@issue.project` triggers a DB query
+
+```ruby
+@issue.project   # SELECT * FROM projects WHERE id = ? — one extra query
+```
+
+This is fine for single records. For lists, use `includes` to avoid N+1 (covered in a future section).
+
+---
+
+## 11. String Helpers — humanize, pluralize & Inflector
+
+### `humanize`
+
+Transforms machine-readable strings into human-readable ones. From **ActiveSupport**.
+
+```ruby
+"in_progress".humanize                    # => "In progress"
+"open".humanize                           # => "Open"
+"employee_salary".humanize                # => "Employee salary"
+"author_id".humanize                      # => "Author"        ← strips _id suffix
+"_mystring".humanize                      # => "Mystring"      ← strips leading _
+"employee_salary".humanize(capitalize: false)  # => "employee salary"
+```
+
+Rules applied in order:
+
+1. Strip leading underscores
+2. Remove `_id` suffix
+3. Replace `_` with spaces
+4. Capitalise the first word only
+
+### `pluralize` — view helper
+
+```ruby
+pluralize(1, "error")   # => "1 error"
+pluralize(2, "error")   # => "2 errors"
+pluralize(0, "error")   # => "0 errors"
+
+# Handles irregular words via the Inflector:
+pluralize(2, "person")  # => "2 people"   ← not "persons"
+pluralize(2, "mouse")   # => "2 mice"
+pluralize(2, "sheep")   # => "2 sheep"    ← uncountable
+
+# Override the plural:
+pluralize(2, "error", plural: "mistakes")  # => "2 mistakes"
+```
+
+`pluralize` is a **view helper** from `ActionView::Helpers::TextHelper` — available in all views automatically. Outside views, use the underlying method:
+
+```ruby
+"error".pluralize      # => "errors"
+"error".pluralize(1)   # => "error"
+"error".pluralize(2)   # => "errors"
+```
+
+### Full Inflector reference
+
+All from **ActiveSupport::Inflector**, available on any String in Rails:
+
+```ruby
+"in_progress".humanize    # => "In progress"     — readable label
+"in_progress".titleize    # => "In Progress"      — every word capitalised
+"in_progress".capitalize  # => "In_progress"      — only first char, keeps underscores!
+"InProgress".underscore   # => "in_progress"      — CamelCase to snake_case
+"in_progress".camelize    # => "InProgress"       — snake_case to CamelCase
+"issue".pluralize         # => "issues"
+"issues".singularize      # => "issue"
+"IssueLabel".tableize     # => "issue_labels"     — used by ActiveRecord for table names
+"issue_label".classify    # => "IssueLabel"       — used by ActiveRecord for class names
+"Issue".foreign_key       # => "issue_id"         — used for FK column names
+```
+
+> **Interview insight**: The Inflector powers Rails' naming conventions end-to-end. `Issue` model → `issues` table (`tableize`), `project_id` FK (`foreign_key`), `IssueLabel` from `issue_label.rb` (`classify`). Zeitwerk uses the same engine. When Rails gets a word wrong (e.g. "octopi" vs "octopuses"), fix it in `config/initializers/inflections.rb`.
+
+---
+
+## 12. Initializers
+
+### What are initializers?
+
+Files in `config/initializers/` run **once at boot**, after the framework loads but before the app starts serving requests. Used for configuration that must happen early and only once.
+
+> ⚠️ Always restart the server after modifying an initializer — unlike models/controllers, they are **not** reloaded between requests in development.
+
+### Load order
+
+Initializers run in **alphabetical order** by filename. If B depends on A, use numeric prefixes:
+
+```
+config/initializers/
+  01_core_config.rb    ← runs first
+  02_devise.rb         ← can safely depend on 01
+  03_sidekiq.rb        ← can depend on 01 and 02
+```
+
+Rails' own internal initializers always run before yours.
+
+### The four default initializers
+
+#### `inflections.rb` — Teach Rails new words
+
+```ruby
+ActiveSupport::Inflector.inflections(:en) do |inflect|
+  inflect.plural /^(ox)$/i, '\1en'        # regex rule: ox → oxen
+  inflect.singular /^(ox)en/i, '\1'       # oxen → ox
+  inflect.irregular "person", "people"    # one-off exception
+  inflect.uncountable %w(fish sheep)      # same singular and plural
+
+  inflect.acronym "API"      # api_controller.rb → APIController not ApiController
+  inflect.acronym "OAuth"
+  inflect.acronym "GraphQL"
+end
+```
+
+#### `filter_parameter_logging.rb` — Protect sensitive data in logs
+
+```ruby
+Rails.application.config.filter_parameters += [
+  :passw, :email, :secret, :token, :_key, :cvv
+]
+```
+
+Without this, passwords appear in plain text in log files:
+
+```
+# Unfiltered — security incident:
+Parameters: {"user"=>{"password"=>"mysecret123"}}
+
+# Filtered — safe:
+Parameters: {"user"=>{"password"=>"[FILTERED]"}}
+```
+
+> **Interview point**: At GitLab scale, logs are shipped to centralised systems (Elasticsearch, Splunk). An unfiltered password in a log is a serious security incident. Always extend this list when adding sensitive fields.
+
+#### `content_security_policy.rb` — Browser security headers
+
+```ruby
+config.content_security_policy do |policy|
+  policy.default_src :self, :https   # only load from own domain over HTTPS
+  policy.script_src  :self, :https   # no inline scripts, no third-party JS
+  policy.object_src  :none           # block Flash and plugins entirely
+  policy.img_src     :self, :https, :data
+  policy.report_uri  "/csp-violation-report-endpoint"
+end
+```
+
+Sets the `Content-Security-Policy` HTTP header — tells browsers what resources they can load. Prevents XSS attacks even if an attacker manages to inject a `<script>` tag.
+
+#### `assets.rb` — Asset pipeline config
+
+```ruby
+Rails.application.config.assets.version = "1.0"
+# Bump this to bust the browser cache for ALL assets at once
+
+Rails.application.config.assets.paths << Rails.root.join("vendor/assets")
+# Add extra directories for the asset pipeline to search
+```
+
+### Common initializers you'll create yourself
+
+```ruby
+# config/initializers/sidekiq.rb
+Sidekiq.configure_server do |config|
+  config.redis = { url: ENV["REDIS_URL"] }
+end
+
+# config/initializers/cors.rb — for API apps
+Rails.application.config.middleware.insert_before 0, Rack::Cors do
+  allow do
+    origins "app.example.com"
+    resource "/api/*", headers: :any, methods: [:get, :post]
+  end
+end
+
+# config/initializers/constants.rb
+SUPPORTED_LOCALES = %w[en fr de ja].freeze
+MAX_UPLOAD_SIZE   = 10.megabytes
+```
+
+---
+
+*Next up: Scopes, N+1 queries & eager loading*
 
 ```bash
 rails new app_name -d postgresql   # new app with postgres

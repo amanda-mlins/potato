@@ -1,2 +1,17 @@
-<h1>Issues#show</h1>
-<p>Find me in app/views/issues/show.html.erb</p>
+<h1>Issue Details</h1>
+<table>
+  <tr>
+    <th>Title</th>
+    <td><%= @issue.title %></td>
+  </tr>
+
+  <tr>
+    <th>Description</th>
+    <td><%= @issue.description %></td>
+  </tr>
+
+  <tr>
+    <th>Project</th>
+    <td><%= link_to @issue.project.name, @issue.project %></td>
+  </tr>
+</table>

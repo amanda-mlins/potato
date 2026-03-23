@@ -1,2 +1,5 @@
-<h1>Issues#edit</h1>
-<p>Find me in app/views/issues/edit.html.erb</p>
+<h1>Edit Issue</h1>
+
+<%= render 'form', issue: @issue, project: @issue.project %>
+
+<%= link_to "Back to issue", issue_path(@issue) %>

@@ -1,2 +1,6 @@
-<h1>Projects#edit</h1>
-<p>Find me in app/views/projects/edit.html.erb</p>
+<h1>Edit Project</h1>
+
+<%= render 'form', project: @project %>
+
+<%= link_to "Back to project #{@project.name}", project_path(@project) %>
+<%= link_to "Back to project list", projects_path %>

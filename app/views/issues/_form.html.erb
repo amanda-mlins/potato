@@ -1,0 +1,31 @@
+<%= form_with(model: issue, url: issue.new_record? ? project_issues_path(project) : issue_path(issue)) do |form| %>
+  <% if issue.errors.any? %>
+    <div id="error_explanation">
+      <h2><%= pluralize(issue.errors.count, "error") %> prohibited this issue from being saved:</h2>
+      <ul>
+        <% issue.errors.full_messages.each do |message| %>
+          <li><%= message %></li>
+        <% end %>
+      </ul>
+    </div>
+  <% end %>
+
+  <div class="field">
+    <%= form.label :title %>
+    <%= form.text_field :title, placeholder: "Issue title" %>
+  </div>
+
+  <div class="field">
+    <%= form.label :description %>
+    <%= form.text_area :description, placeholder: "Describe the issue...", rows: 5 %>
+  </div>
+
+  <div class="field">
+    <%= form.label :status %>
+    <%= form.select :status, Issue.statuses.keys.map { |s| [s.humanize, s] }, { include_blank: false } %>
+  </div>
+
+  <div class="actions">
+    <%= form.submit %>
+  </div>
+<% end %>

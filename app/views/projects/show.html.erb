@@ -1,2 +1,23 @@
-<h1>Projects#show</h1>
-<p>Find me in app/views/projects/show.html.erb</p>
+<h1>Project Details</h1>
+<h2><%= @project.name %></h2>
+<button><%= link_to 'Create New Issue', new_project_issue_path(project_id: @project.id) %></button>
+<table>
+  <thead>
+    <tr>
+      <th>Title</th>
+      <th colspan="3">Actions</th>
+    </tr>
+  </thead>
+
+  <tbody>
+    <% @project.issues.each do |issue| %>
+      <tr>
+        <td><%= issue.title %></td>
+        <td><%= link_to 'Show', issue %></td>
+        <td><%= link_to 'Edit', edit_issue_path(issue) %></td>
+        <td><%= link_to 'Destroy', issue, method: :delete, data: { confirm: 'Are you sure?' } %></td>
+      </tr>
+    <% end %>
+  </tbody>
+</table>
+<%= link_to "Back to projects", projects_path %>
