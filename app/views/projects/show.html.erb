@@ -1,6 +1,6 @@
 <h1>Project Details</h1>
 <h2><%= @project.name %></h2>
-<button><%= link_to 'Create New Issue', new_project_issue_path(project_id: @project.id) %></button>
+<button><%= link_to 'Create New Issue', new_project_issue_path(@project) %></button>
 <table>
   <thead>
     <tr>
@@ -15,7 +15,7 @@
         <td><%= issue.title %></td>
         <td><%= link_to 'Show', issue %></td>
         <td><%= link_to 'Edit', edit_issue_path(issue) %></td>
-        <td><%= link_to 'Destroy', issue, method: :delete, data: { confirm: 'Are you sure?' } %></td>
+        <td><%= link_to 'Destroy', issue, data: { turbo_method: :delete, turbo_confirm: 'Are you sure?' } %></td>
       </tr>
     <% end %>
   </tbody>
