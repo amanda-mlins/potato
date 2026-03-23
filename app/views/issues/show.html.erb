@@ -9,6 +9,14 @@
     <th>Description</th>
     <td><%= @issue.description %></td>
   </tr>
+  <tr>
+    <th>Status</th>
+    <td><%= @issue.status %></td>
+  </tr>
+  <tr>
+    <th>Labels</th>
+    <td><%= @issue.labels.map(&:name).join(", ") %></td>
+  </tr>
 
   <tr>
     <th>Project</th>

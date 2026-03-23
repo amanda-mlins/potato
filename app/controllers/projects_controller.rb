@@ -6,7 +6,7 @@ class ProjectsController < ApplicationController
   end
 
   def show
-    @issues = @project.issues.order(created_at: :desc)
+    @issues = @project.issues.recent.with_labels
   end
 
   def new

@@ -20,6 +20,9 @@
 10. [Views, Partials & Form Helpers](#10-views-partials--form-helpers)
 11. [String Helpers — humanize, pluralize & Inflector](#11-string-helpers--humanize-pluralize--inflector)
 12. [Initializers](#12-initializers)
+13. [Scopes](#13-scopes)
+14. [N+1 Queries & Eager Loading](#14-n1-queries--eager-loading)
+15. [SQL Joins](#15-sql-joins)
 
 ---
 
@@ -788,6 +791,10 @@ MAX_UPLOAD_SIZE   = 10.megabytes
 
 *Next up: Scopes, N+1 queries & eager loading*
 
+---
+
+## Quick Reference: Key Rails Commands
+
 ```bash
 rails new app_name -d postgresql   # new app with postgres
 rails generate model User name:string email:string
@@ -806,4 +813,296 @@ rails console                      # interactive REPL with app loaded
 
 ---
 
-*Next up: Views, Partials, and Form Helpers*
+## 13. Scopes
+
+Scopes are named, reusable query fragments defined on the model. They return an `ActiveRecord::Relation` so they are **chainable**.
+
+### Defining scopes
+
+```ruby
+class Issue < ApplicationRecord
+  scope :recent,      -> { order(created_at: :desc) }
+  scope :by_status,   ->(status) { where(status: status) }
+  scope :with_labels, -> { includes(:labels) }
+end
+```
+
+The `->` is a **lambda** — it ensures the scope is evaluated lazily at call time, not at class load time. This matters for time-based scopes:
+
+```ruby
+# ❌ Wrong — evaluated once at boot, date never changes
+scope :recent, where("created_at > ?", 1.week.ago)
+
+# ✅ Correct — lambda evaluated fresh on every call
+scope :recent, -> { where("created_at > ?", 1.week.ago) }
+```
+
+### Chaining scopes
+
+Because each scope returns a relation, you can chain them freely:
+
+```ruby
+Issue.recent.by_status(:open).with_labels
+# => SELECT issues.* ... WHERE status = 0 ORDER BY created_at DESC
+#    + separate query for labels via includes
+```
+
+### Scopes vs class methods
+
+A scope is essentially syntactic sugar for a class method. These two are equivalent:
+
+```ruby
+# Scope
+scope :open_issues, -> { where(status: :open) }
+
+# Class method — identical behaviour
+def self.open_issues
+  where(status: :open)
+end
+```
+
+Prefer scopes for simple queries (more expressive). Use class methods when you need conditionals or complex logic:
+
+```ruby
+def self.by_status(status)
+  return all if status.blank?   # scopes can't easily do this — returns all records
+  where(status: status)
+end
+```
+
+> 💡 **Key insight**: A scope that returns `nil` breaks chaining — Rails replaces a `nil` return from a scope with `all` automatically. A class method that returns `nil` does **not** get this protection — it would raise a `NoMethodError` when chained. Another reason to use class methods with explicit `return all` guards.
+
+### Enum scopes — free from the enum declaration
+
+```ruby
+enum :status, { open: 0, in_progress: 1, closed: 2 }
+# Automatically creates:
+Issue.open         # WHERE status = 0
+Issue.in_progress  # WHERE status = 1
+Issue.closed       # WHERE status = 2
+```
+
+These are just scopes generated for free — fully chainable with your own scopes:
+
+```ruby
+Issue.open.recent.with_labels
+```
+
+---
+
+## 14. N+1 Queries & Eager Loading
+
+### What is an N+1?
+
+A loop that fires one query per iteration instead of loading everything upfront:
+
+```ruby
+# 1 query to load projects
+projects = Project.all
+
+projects.each do |project|
+  project.issues.each do |issue|    # 1 query per project (N)
+    issue.labels.map(&:name)        # 1 query per issue (N×M)
+  end
+end
+# Total: 1 + N + (N×M) queries
+# With 3 projects, 5 issues each: 1 + 3 + 15 = 19 queries
+# With 100 projects, 50 issues each: 1 + 100 + 5000 = 5101 queries
+```
+
+The tell-tale sign in logs: **the same SQL repeated with only the `id` changing**.
+
+### The fix — `includes`
+
+```ruby
+# Loads everything in 3 queries regardless of record count
+Project.includes(issues: :labels)
+
+# Query 1: SELECT projects.*
+# Query 2: SELECT issues.* WHERE project_id IN (1, 2, 3)
+# Query 3: SELECT labels.* WHERE id IN (1, 2, 3, ...)
+# Rails stitches associations together in Ruby memory
+```
+
+### `includes` vs `preload` vs `eager_load`
+
+| Method | SQL strategy | Use when |
+| --- | --- | --- |
+| `includes` | Auto-picks (see below) | Always — it chooses the best strategy |
+| `preload` | Separate `IN` queries always | Force separate queries |
+| `eager_load` | `LEFT OUTER JOIN` always | Force a JOIN |
+
+**`includes` auto-switching behaviour:**
+
+```ruby
+# No where/order on association → uses separate IN queries (preload strategy)
+Issue.includes(:labels)
+# SELECT issues.* ...
+# SELECT labels.* WHERE id IN (...)
+
+# References associated table in where/order → switches to LEFT OUTER JOIN
+Issue.includes(:labels).where(labels: { name: "backend" })
+# SELECT issues.*, labels.* FROM issues
+# LEFT OUTER JOIN issue_labels ON ...
+# LEFT OUTER JOIN labels ON ...
+# WHERE labels.name = 'backend'
+```
+
+### Applying the fix to the index page scenario
+
+If you want to show labels on the projects index page, you must eager load the full chain:
+
+```ruby
+# Controller — index action
+@projects = Project.includes(issues: :labels).order(created_at: :desc)
+#                            ^^^^^^^^^^^^^^^ nested includes syntax
+```
+
+Without this, the view loop:
+
+```erb
+<% @projects.each do |project| %>
+  <% project.issues.each do |issue| %>
+    <% issue.labels.each do |label| %>   ← N×M extra queries
+```
+
+...fires a query for every single issue's labels.
+
+### `joins` vs `includes` — a critical distinction
+
+```ruby
+Project.joins(:issues)
+# INNER JOIN — filters to projects WITH issues
+# Does NOT load issues into memory
+# project.issues still fires a new query!
+
+Project.includes(:issues)
+# Loads issues into memory
+# project.issues uses cached data — no extra query
+```
+
+Use `joins` for **filtering**. Use `includes` for **displaying data**.
+
+```ruby
+# Find projects that have open issues, and display those issues' labels
+Project.joins(:issues)
+       .where(issues: { status: :open })
+       .includes(issues: :labels)
+       .distinct
+```
+
+### Rails query cache
+
+Within a single request, Rails caches identical SQL queries. If the same query fires twice, the second hit returns instantly from memory — you'll see `CACHE` in the logs:
+
+```
+Issue Load (2.1ms)  SELECT "issues".* WHERE project_id IN (1,2,3)
+CACHE Issue Load (0.0ms)  SELECT "issues".* WHERE project_id IN (1,2,3)  ← free
+```
+
+### Detecting N+1s automatically — the `bullet` gem
+
+Add to `Gemfile`:
+
+```ruby
+group :development do
+  gem "bullet"
+end
+```
+
+Configure in `config/environments/development.rb`:
+
+```ruby
+config.after_initialize do
+  Bullet.enable       = true
+  Bullet.alert        = true   # browser alert popup
+  Bullet.rails_logger = true   # log to Rails logger
+end
+```
+
+Bullet will automatically warn you whenever an N+1 is detected during development — you don't have to manually read logs.
+
+---
+
+## 15. SQL Joins
+
+Using our data as an example:
+
+```
+projects              issues
+--------              ------
+1  Alpha              1  Fix bug      project_id: 1
+2  Beta               2  Add feature  project_id: 1
+3  Gamma              (no issues for Beta or Gamma)
+```
+
+### INNER JOIN
+
+Returns rows where there is a match **in both tables**. Unmatched rows are dropped.
+
+```sql
+SELECT projects.name, issues.title
+FROM projects INNER JOIN issues ON issues.project_id = projects.id
+-- Result:
+-- Alpha | Fix bug
+-- Alpha | Add feature
+-- Beta and Gamma disappear — they had no issues
+```
+
+**ActiveRecord**: `Project.joins(:issues)` — use for filtering to records that have associations.
+
+### LEFT OUTER JOIN
+
+Returns **all rows from the left table**. Unmatched right-side columns are `NULL`.
+
+```sql
+SELECT projects.name, issues.title
+FROM projects LEFT OUTER JOIN issues ON issues.project_id = projects.id
+-- Result:
+-- Alpha | Fix bug
+-- Alpha | Add feature
+-- Beta  | NULL    ← kept even with no issues
+-- Gamma | NULL    ← kept even with no issues
+```
+
+**ActiveRecord**: `Project.left_outer_joins(:issues)` or `Project.eager_load(:issues)`.
+Use when you need **all records regardless of whether they have associations**.
+
+### RIGHT OUTER JOIN
+
+Opposite of LEFT — keeps all rows from the **right table**, `NULL` for unmatched left side. Rarely used in Rails (just flip table order and use LEFT JOIN instead).
+
+### FULL OUTER JOIN
+
+All rows from **both** tables. `NULL` fills in wherever there's no match on either side. Not available in ActiveRecord directly — requires `find_by_sql` with raw SQL.
+
+### CROSS JOIN
+
+Every row from the left combined with every row from the right (cartesian product). 3 projects × 3 issues = 9 rows. Rarely useful.
+
+### Quick decision guide
+
+```
+Need all records even with no associations?  → LEFT OUTER JOIN
+Only want records that have associations?    → INNER JOIN
+Filtering/sorting by an associated column?   → INNER or LEFT OUTER JOIN
+Just eager loading for display?              → let includes use separate IN queries
+```
+
+### Key Rails gotcha — `joins` does NOT load data
+
+```ruby
+project = Project.joins(:issues).first
+project.issues   # ← fires ANOTHER query! joins only filtered, didn't load
+```
+
+vs
+
+```ruby
+project = Project.eager_load(:issues).first
+project.issues   # ← no extra query — data already in memory
+```
+
+---
+
+*Next up: Testing with RSpec / Minitest*

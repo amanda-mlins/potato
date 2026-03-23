@@ -64,3 +64,8 @@ group :test do
   gem "capybara"
   gem "selenium-webdriver"
 end
+
+# Bullet helps to kill N+1 queries and unused eager loading
+group :development do
+  gem "bullet"
+end
