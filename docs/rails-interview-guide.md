@@ -23,6 +23,9 @@
 13. [Scopes](#13-scopes)
 14. [N+1 Queries & Eager Loading](#14-n1-queries--eager-loading)
 15. [SQL Joins](#15-sql-joins)
+16. [Zero-Downtime Migrations](#16-zero-downtime-migrations)
+17. [DDL Transactions & Index Algorithms](#17-ddl-transactions--index-algorithms)
+18. [PostgreSQL Deep Dive](#18-postgresql-deep-dive)
 
 ---
 
@@ -1102,6 +1105,578 @@ vs
 project = Project.eager_load(:issues).first
 project.issues   # ← no extra query — data already in memory
 ```
+
+---
+
+## 16. Zero-Downtime Migrations
+
+When you have millions of rows and live traffic, a naive migration can lock a table for minutes, causing 503 errors. The app must keep working with **both the old and new schema simultaneously** during a deploy.
+
+> GitLab enforces zero-downtime migration patterns through a custom CI linter — any migration that could cause a lock on a large table fails the pipeline automatically.
+
+### The naive (dangerous) approach
+
+```ruby
+# ❌ On PostgreSQL < 11, this rewrites the entire table — minutes of lock
+add_column :issues, :author_name, :string, null: false, default: "unknown"
+```
+
+### The safe 3-step pattern
+
+Split what would be one migration into three, deployed separately:
+
+#### Step 1 — Add the column nullable, no default (instant, no lock)
+
+```ruby
+class AddAuthorNameToIssues < ActiveRecord::Migration[8.1]
+  def change
+    add_column :issues, :author_name, :string
+    # Nullable by design — old code ignores it, new code can write to it
+    # No table rewrite, no lock, completes in milliseconds
+  end
+end
+```
+
+**During this deploy**: old code ignores the new column ✅, new code reads/writes it ✅.
+
+#### Step 2 — Backfill existing NULL rows in batches
+
+Never backfill inside a migration that holds a lock. Use `in_batches` with `disable_ddl_transaction!`:
+
+```ruby
+class BackfillAuthorNameOnIssues < ActiveRecord::Migration[8.1]
+  disable_ddl_transaction! # each batch commits independently
+
+  def up
+    # Use a local anonymous model — immune to future app model changes
+    klass = Class.new(ActiveRecord::Base) { self.table_name = "issues" }
+
+    klass.where(author_name: nil).in_batches(of: 1000) do |batch|
+      batch.update_all(author_name: "unknown")
+      sleep(0.01) # brief pause — avoids overwhelming DB on huge tables
+    end
+  end
+
+  def down; end
+end
+```
+
+**Why an anonymous model?** If you use `Issue.where(...)` and later rename or remove the `Issue` class, this migration breaks when someone runs it on a fresh database. The anonymous model is self-contained.
+
+#### Step 3 — Add NOT NULL constraint (after backfill confirmed complete)
+
+```ruby
+class AddNotNullToIssuesAuthorName < ActiveRecord::Migration[8.1]
+  def up
+    # Safe because zero NULLs remain in the table
+    change_column_null :issues, :author_name, false
+
+    # For very large tables, use PostgreSQL's non-blocking approach instead:
+    # execute "ALTER TABLE issues ADD CONSTRAINT issues_author_name_not_null
+    #          CHECK (author_name IS NOT NULL) NOT VALID;"
+    # execute "ALTER TABLE issues VALIDATE CONSTRAINT issues_author_name_not_null;"
+    # NOT VALID = instant (skips existing rows)
+    # VALIDATE  = scans rows but only takes a SHARE lock (reads still work)
+  end
+
+  def down
+    change_column_null :issues, :author_name, true
+  end
+end
+```
+
+### The 3-deploy timeline
+
+```
+Deploy 1 → Step 1: add nullable column
+           Old code: ignores column ✅  New code: writes to it ✅
+
+Deploy 2 → Step 2: backfill NULLs in batches (zero lock)
+           Confirm: zero NULL rows remain
+
+Deploy 3 → Step 3: add NOT NULL constraint
+           Safe because no NULLs exist ✅
+```
+
+### `in_batches` vs `find_each` vs `update_all`
+
+```ruby
+# update_all — one giant SQL, no Ruby objects, fastest — but locks whole table
+Issue.update_all(author_name: "unknown")
+# UPDATE issues SET author_name = 'unknown'  ← one huge lock
+
+# find_each — loads rows into Ruby, triggers callbacks, fires N UPDATEs — very slow
+Issue.find_each(batch_size: 1000) { |i| i.update!(author_name: "unknown") }
+
+# in_batches + update_all — best of both worlds ✅
+Issue.in_batches(of: 1000) { |batch| batch.update_all(author_name: "unknown") }
+# UPDATE ... WHERE id IN (1..1000)   → COMMIT  (lock released)
+# UPDATE ... WHERE id IN (1001..2000) → COMMIT  (lock released)
+```
+
+### Renaming a column — never rename directly
+
+```ruby
+# ❌ Breaks running app immediately — old code references old column name
+rename_column :issues, :title, :subject
+
+# ✅ Safe multi-step approach:
+# 1. add_column :issues, :subject, :string
+# 2. Write to BOTH columns in app code (transition period)
+# 3. Backfill: Issue.in_batches { |b| b.update_all("subject = title") }
+# 4. Switch reads to new column, deploy
+# 5. Remove old column in a later deploy
+```
+
+### Removing a column — ignore it first
+
+```ruby
+# ❌ Remove column while app still references it → NoMethodError crash
+remove_column :issues, :old_field
+
+# ✅ Safe approach:
+# Step 1 — Tell ActiveRecord to ignore the column BEFORE the migration
+class Issue < ApplicationRecord
+  self.ignored_columns += [:old_field]  # app stops reading/writing it
+end
+# Deploy this code first
+
+# Step 2 — Now safely remove the column in a migration
+remove_column :issues, :old_field
+```
+
+---
+
+## 17. DDL Transactions & Index Algorithms
+
+### What is DDL?
+
+**DDL** (Data Definition Language) = SQL that changes database **structure**:
+
+```sql
+-- DDL — structure changes
+ALTER TABLE issues ADD COLUMN author_name VARCHAR
+CREATE INDEX index_issues_on_status ON issues (status)
+DROP TABLE labels
+
+-- DML — data changes (not DDL)
+INSERT INTO issues ...
+UPDATE issues SET author_name = 'x'
+SELECT * FROM issues
+```
+
+### Why Rails wraps migrations in transactions
+
+By default every migration runs inside a transaction:
+
+```sql
+BEGIN
+  ALTER TABLE issues ADD COLUMN ...  -- acquires exclusive lock
+  UPDATE issues SET ...
+COMMIT  -- lock released only here
+```
+
+If anything fails, the `ROLLBACK` undoes the entire migration — your schema is never left half-applied. This is only possible because **PostgreSQL supports transactional DDL** (unlike MySQL/MariaDB, where `ALTER TABLE` auto-commits and cannot be rolled back).
+
+### The lock problem
+
+An exclusive lock from `ALTER TABLE` blocks ALL other queries against that table for the transaction's duration:
+
+```
+ALTER TABLE issues ADD COLUMN ...  ← exclusive lock acquired
+  ← SELECT * FROM issues           → BLOCKED (user gets spinner)
+  ← INSERT INTO issues ...         → BLOCKED
+COMMIT                             ← lock released, blocked queries run
+```
+
+On a table with 50 million rows, a migration that rewrites rows can hold this lock for **minutes**.
+
+### `disable_ddl_transaction!`
+
+Opts out of the wrapping transaction — each statement commits immediately:
+
+```ruby
+class MyMigration < ActiveRecord::Migration[8.1]
+  disable_ddl_transaction!
+
+  def change
+    # Each statement commits on its own
+    # DB can serve other queries between statements
+    # Tradeoff: no automatic rollback if migration fails halfway
+  end
+end
+```
+
+Required for:
+
+- `algorithm: :concurrently` index builds
+- Large batched backfills
+
+### `add_index` algorithms
+
+#### `algorithm: :default` (implicit default)
+
+```ruby
+add_index :issues, :status
+```
+
+```sql
+CREATE INDEX index_issues_on_status ON issues (status)
+```
+
+- Acquires **exclusive lock** — blocks all reads and writes during build
+- Single pass — faster to complete
+- Safe inside a transaction
+- Use for: new tables, small tables, initial setup
+
+#### `algorithm: :concurrently`
+
+```ruby
+class AddIndexToIssuesStatus < ActiveRecord::Migration[8.1]
+  disable_ddl_transaction! # required — concurrent index can't run in a transaction
+
+  def change
+    add_index :issues, :status, algorithm: :concurrently
+  end
+end
+```
+
+```sql
+CREATE INDEX CONCURRENTLY index_issues_on_status ON issues (status)
+```
+
+- Takes a **weaker lock** — reads and writes continue normally
+- Multiple passes over the table — ~2-3x slower but non-blocking
+- **Cannot run inside a transaction** — requires `disable_ddl_transaction!`
+- Use for: **any table with live traffic**
+
+How PostgreSQL builds it in 3 passes:
+
+```
+Pass 1: Scan table, build initial index — normal writes still happen
+Pass 2: Catch up on changes made during pass 1
+Pass 3: Mark index as valid and ready to use
+```
+
+`remove_index` also supports concurrent:
+
+```ruby
+remove_index :issues, :status, algorithm: :concurrently
+```
+
+### Other index options
+
+```ruby
+# Unique index
+add_index :issues, :title, unique: true
+
+# Composite index — column order matters for query planning
+add_index :issues, [:project_id, :status]
+# Useful for: WHERE project_id = ? AND status = ?
+# Also covers: WHERE project_id = ?  (leftmost prefix)
+# NOT useful for: WHERE status = ?   (rightmost only)
+
+# Partial index — only indexes rows matching a condition
+# Much smaller and faster than a full index
+add_index :issues, :project_id, where: "status = 0"
+# Only indexes open issues — if 90% of queries filter by open,
+# this index is 90% smaller and fits in memory
+
+# Expression index (PostgreSQL specific)
+add_index :issues, "lower(author_name)"
+# Enables fast case-insensitive lookups:
+# WHERE lower(author_name) = lower('Alice')
+
+# Custom name (useful when auto-generated name exceeds 63 char limit)
+add_index :issues, [:project_id, :status], name: "idx_issues_active_by_project"
+
+# Combining concurrent + partial
+add_index :issues, :project_id,
+          where: "status != 2",
+          algorithm: :concurrently,
+          name: "idx_issues_active_project"
+```
+
+> **Interview insight — Partial indexes**: GitLab uses partial indexes extensively. If you have an `issues` table with 100M rows but 95% are `closed`, an index on `project_id WHERE status != 2` covers only the 5M active rows — fits in memory, blazing fast. Always ask "what percentage of rows does this index actually need to cover?"
+
+---
+
+## 18. PostgreSQL Deep Dive
+
+### 18.1 Partial Indexes
+
+A regular index covers **every row**. A partial index covers only rows **matching a WHERE condition** — smaller, faster, fits in RAM more easily.
+
+```sql
+-- Regular index — covers ALL 10M issues (~500MB)
+CREATE INDEX idx_issues_project ON issues (project_id);
+
+-- Partial index — covers only OPEN issues (5% of total, ~25MB)
+CREATE INDEX idx_issues_active_project ON issues (project_id)
+WHERE status = 0;
+```
+
+```ruby
+# Rails:
+add_index :issues, :project_id,
+          where: "status = 0",
+          algorithm: :concurrently,
+          name: "idx_issues_active_project"
+```
+
+The query **must match the condition** to use the index:
+
+```sql
+-- Uses the partial index ✅
+SELECT * FROM issues WHERE project_id = 5 AND status = 0;
+
+-- Cannot use it ❌
+SELECT * FROM issues WHERE project_id = 5;
+```
+
+Common real-world uses:
+
+- `WHERE deleted_at IS NULL` — only index non-deleted records (soft deletes)
+- `WHERE status != 'closed'` — only active work items
+- `WHERE locked = false` — only available resources
+
+### 18.2 Index Types
+
+The default index type is **B-Tree** (Balanced Tree) — `O(log n)` lookups, supports `=`, `<`, `>`, `BETWEEN`, `LIKE 'abc%'` (prefix only). Does NOT help with `LIKE '%abc'` (suffix).
+
+Other PostgreSQL index types:
+
+```ruby
+# GIN — Generalized Inverted Index
+# Best for: arrays, JSONB, full-text search
+add_index :issues, :tags, using: :gin
+# Enables: WHERE tags @> '{backend}'
+
+add_index :issues, "to_tsvector('english', description)", using: :gin
+# Enables: full-text search
+
+# GiST — Generalized Search Tree
+# Best for: geometric data, ranges, fuzzy string matching
+add_index :events, "tsrange(starts_at, ends_at)", using: :gist
+
+# BRIN — Block Range Index
+# Best for: naturally ordered huge tables (time-series, append-only logs)
+# Tiny size — stores only min/max per block of pages
+add_index :events, :created_at, using: :brin
+# 10M rows → ~100KB vs ~500MB B-Tree
+
+# Hash — equality only (=), slightly faster than B-Tree for pure equality
+add_index :issues, :status, using: :hash
+```
+
+### 18.3 JSONB — PostgreSQL's Superpower
+
+Native binary JSON — queryable and indexable:
+
+```ruby
+# Migration
+add_column :issues, :metadata, :jsonb, default: {}
+add_index :issues, :metadata, using: :gin  # indexes entire JSONB column
+```
+
+```ruby
+# ActiveRecord querying
+Issue.where("metadata->>'priority' = ?", "high")
+Issue.where("metadata @> ?", { labels: ["bug"] }.to_json)  # contains
+Issue.where("(metadata->>'score')::int > 5")
+```
+
+```sql
+-- JSONB operators
+metadata->>'key'             -- extract value as text
+metadata->'key'              -- extract as JSONB (preserves type)
+metadata @> '{"key":"val"}'  -- contains (uses GIN index) ✅ fast
+metadata ? 'key'             -- key exists
+metadata #>> '{a,b,c}'       -- nested path extraction
+```
+
+Always use `jsonb` over `json` — `json` stores raw text and re-parses on every access; `jsonb` stores binary format and supports indexing.
+
+### 18.4 `EXPLAIN ANALYZE` — Reading Query Plans
+
+Always check the query plan before adding an index — and after, to confirm it's being used:
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM issues WHERE project_id = 5 AND status = 0;
+```
+
+```
+Bitmap Heap Scan on issues  (cost=4.50..28.62 rows=12 width=150)
+                             (actual time=0.082..0.091 rows=5 loops=1)
+  ->  Bitmap Index Scan on idx_issues_active_project
+        (actual time=0.071..0.071 rows=5 loops=1)
+Planning Time: 0.3 ms
+Execution Time: 0.4 ms
+```
+
+Key terms to know:
+
+| Term | Meaning |
+| --- | --- |
+| `Seq Scan` | Full table scan — no index used, reads every row |
+| `Index Scan` | Used an index, random heap access |
+| `Bitmap Index Scan` | Used an index, batches heap accesses — efficient for multiple rows |
+| `cost=X..Y` | Estimated cost (X=startup, Y=total) — relative units, not ms |
+| `rows=N` | Estimated rows — if far off from actual, run `ANALYZE` to refresh stats |
+| `actual time` | Real milliseconds — compare against estimated |
+
+In Rails (safe to run in production — no ANALYZE):
+
+```ruby
+puts Issue.where(project_id: 5, status: :open).explain
+```
+
+### 18.5 Transactions & Isolation Levels
+
+```ruby
+# Wraps everything in BEGIN/COMMIT — if anything raises, full ROLLBACK
+ActiveRecord::Base.transaction do
+  project.update!(status: :archived)
+  project.issues.update_all(status: :closed)
+end
+```
+
+The 4 isolation levels and what they prevent:
+
+| Level | Dirty Read | Non-repeatable Read | Phantom Read |
+| --- | --- | --- | --- |
+| `READ UNCOMMITTED` | possible | possible | possible |
+| `READ COMMITTED` ← PG default | prevented | possible | possible |
+| `REPEATABLE READ` | prevented | prevented | possible |
+| `SERIALIZABLE` | prevented | prevented | prevented |
+
+- **Dirty read**: reading uncommitted data from another transaction
+- **Non-repeatable read**: same row read twice returns different values
+- **Phantom read**: same query run twice returns different rows (insert/delete happened)
+
+```ruby
+# Use SERIALIZABLE for financial transactions
+ActiveRecord::Base.transaction(isolation: :serializable) do
+  account = Account.lock.find(id)  # SELECT FOR UPDATE — pessimistic lock
+  account.update!(balance: account.balance - 100)
+end
+```
+
+### 18.6 Pessimistic vs Optimistic Locking
+
+**Pessimistic locking** — lock the row in the DB, others wait:
+
+```ruby
+# SELECT ... FOR UPDATE — blocks other transactions from updating this row
+account = Account.lock.find(id)
+account.update!(balance: account.balance - 100)
+```
+
+**Optimistic locking** — no DB lock, detect conflicts in Ruby:
+
+```ruby
+# Add lock_version column
+add_column :issues, :lock_version, :integer, default: 0
+
+# Rails increments lock_version on each update automatically
+issue_a = Issue.find(1)  # lock_version: 5
+issue_b = Issue.find(1)  # lock_version: 5
+
+issue_a.update!(title: "First save")   # lock_version → 6 ✅
+issue_b.update!(title: "Second save")  # raises ActiveRecord::StaleObjectError ❌
+# The WHERE lock_version = 5 condition no longer matches
+```
+
+Use **pessimistic** for: financial operations, inventory — where conflicts are frequent and costly.
+Use **optimistic** for: user-facing forms, low-contention updates — avoids DB-level locks at the cost of retry logic.
+
+### 18.7 MVCC & VACUUM — Table Bloat
+
+PostgreSQL uses **MVCC** (Multi-Version Concurrency Control) — it never overwrites rows, it writes new versions and marks old ones as dead:
+
+```sql
+UPDATE issues SET status = 1 WHERE id = 5;
+-- Old row: (id:5, status:0) → marked DEAD, still on disk
+-- New row: (id:5, status:1) → written to new page
+```
+
+Dead rows accumulate → **table bloat** → slower queries, wasted disk.
+
+`VACUUM` cleans them up:
+
+```sql
+VACUUM issues;          -- removes dead rows, no table lock
+VACUUM ANALYZE issues;  -- removes dead rows + refreshes query planner stats
+VACUUM FULL issues;     -- reclaims disk, rewrites table — LOCKS the table
+```
+
+PostgreSQL runs **autovacuum** automatically, but on high-write tables it can fall behind. Check for bloat:
+
+```ruby
+ActiveRecord::Base.connection.execute(<<~SQL)
+  SELECT relname,
+         n_dead_tup,
+         n_live_tup,
+         round(n_dead_tup::numeric / nullif(n_live_tup, 0) * 100, 2) AS dead_pct
+  FROM pg_stat_user_tables
+  ORDER BY n_dead_tup DESC;
+SQL
+```
+
+### 18.8 Connection Pooling
+
+Every Rails request needs a DB connection. PostgreSQL has a hard connection limit (typically 100–500). At scale you need a **connection pooler**:
+
+```
+Rails (Puma: 10 threads × 20 workers = 200 connections needed)
+      ↓
+  PgBouncer (connection pooler)
+      ↓
+PostgreSQL (max_connections = 100)
+```
+
+PgBouncer modes:
+
+| Mode | Behaviour | Compatibility |
+| --- | --- | --- |
+| Session | One DB connection per client session | Full Rails compatibility |
+| Transaction | Connection returned to pool after each transaction | GitLab uses this — most efficient |
+| Statement | Connection returned after each statement | Incompatible with many Rails features |
+
+Rails pool config in `database.yml`:
+
+```yaml
+pool: <%= ENV.fetch("RAILS_MAX_THREADS") { 5 } %>
+```
+
+> **Interview answer to "how does GitLab handle database scaling?"**: Horizontal read replicas for read traffic + PgBouncer in transaction mode for connection pooling + vertical scaling for the write primary + aggressive partial indexes and query optimization.
+
+### 18.9 UPSERT — Insert or Update Atomically
+
+```ruby
+# Bulk upsert — Rails 6+
+Issue.upsert_all(
+  [
+    { title: "Bug fix", status: 0, project_id: 1 },
+    { title: "Feature", status: 0, project_id: 1 }
+  ],
+  unique_by: :title
+)
+
+# find_or_create_by — has a race condition in concurrent environments!
+# Two processes both check "exists?" → both get "no" → both INSERT → conflict
+Issue.find_or_create_by(title: "Bug fix")
+
+# create_or_find_by — race-condition-safe ✅
+# Attempts INSERT first, handles unique constraint conflict at DB level
+Issue.create_or_find_by(title: "Bug fix") do |issue|
+  issue.status = :open
+  issue.project_id = 1
+end
+```
+
+> `find_or_create_by` is a classic **TOCTOU** (Time-of-Check-Time-of-Use) race condition — always prefer `create_or_find_by` in concurrent contexts.
 
 ---
 
