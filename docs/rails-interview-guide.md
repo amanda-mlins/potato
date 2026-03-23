@@ -26,6 +26,8 @@
 16. [Zero-Downtime Migrations](#16-zero-downtime-migrations)
 17. [DDL Transactions & Index Algorithms](#17-ddl-transactions--index-algorithms)
 18. [PostgreSQL Deep Dive](#18-postgresql-deep-dive)
+19. [Foreign Keys, Database Locks & Constraint Patterns](#19-foreign-keys-database-locks--constraint-patterns)
+20. [Migration Methods — `change` vs `up`/`down`](#20-migration-methods--change-vs-updown)
 
 ---
 
@@ -134,7 +136,7 @@ rails db:migrate:status   # shows up/down status for every migration
 
 ### Our data model
 
-```
+```text
 projects ──< issues >──< issue_labels >──< labels
 ```
 
@@ -171,7 +173,7 @@ end
 ### `dependent:` options
 
 | Option | Behaviour | Use when |
-|---|---|---|
+| --- | --- | --- |
 | `:destroy` | Loads each child into Ruby, calls `.destroy` — **triggers callbacks** | Children have their own associations/callbacks |
 | `:delete_all` | Single `DELETE` SQL — **skips callbacks** | Leaf nodes, performance-critical bulk deletes |
 | `:nullify` | Sets FK to `NULL`, children survive | e.g. deleting a user shouldn't delete their issues |
@@ -291,7 +293,7 @@ enum :status, [:open, :in_progress, :closed]
 ### Bang vs non-bang
 
 | Method | On failure |
-|---|---|
+| --- | --- |
 | `create` / `save` / `update` | Returns `false` or unsaved record with `errors` |
 | `create!` / `save!` / `update!` | Raises `ActiveRecord::RecordInvalid` |
 
@@ -358,7 +360,7 @@ Zeitwerk is Rails' autoloader (default since Rails 6). You **never write `requir
 
 ### The convention
 
-```
+```text
 app/models/project.rb                    → Project
 app/models/issue_label.rb               → IssueLabel
 app/controllers/projects_controller.rb  → ProjectsController
@@ -369,7 +371,7 @@ app/services/billing/invoicer.rb        → Billing::Invoicer
 
 ### How loading works
 
-```
+```text
 1. App boots → Zeitwerk scans all app/** directories
 2. Builds a map: constant name → file path
 3. First time code references `Project` → Zeitwerk loads the file
@@ -379,7 +381,7 @@ app/services/billing/invoicer.rb        → Billing::Invoicer
 ### Development vs Production
 
 | Environment | `eager_load` | Behaviour |
-|---|---|---|
+| --- | --- | --- |
 | Development | `false` | Lazy loads on demand, watches for file changes, reloads between requests |
 | Production | `true` | Eager loads everything at boot — no file watching, faster requests |
 
@@ -424,7 +426,7 @@ end
 
 **Collection routes** (need project context — include `:project_id`):
 
-```
+```text
 GET  /projects/:project_id/issues      → issues#index
 POST /projects/:project_id/issues      → issues#create
 GET  /projects/:project_id/issues/new  → issues#new
@@ -432,7 +434,7 @@ GET  /projects/:project_id/issues/new  → issues#new
 
 **Member routes** (issue ID is enough — no `:project_id` needed):
 
-```
+```text
 GET    /issues/:id       → issues#show
 GET    /issues/:id/edit  → issues#edit
 PATCH  /issues/:id       → issues#update
@@ -537,7 +539,7 @@ end
 
 Files prefixed with `_` are **partials** — reusable view fragments. They are never rendered directly; always rendered from another view via `render`.
 
-```
+```text
 app/views/issues/_form.html.erb   ← partial (note the underscore)
 app/views/issues/new.html.erb     ← full view, renders the partial
 app/views/issues/edit.html.erb    ← full view, renders the same partial
@@ -699,7 +701,7 @@ Files in `config/initializers/` run **once at boot**, after the framework loads 
 
 Initializers run in **alphabetical order** by filename. If B depends on A, use numeric prefixes:
 
-```
+```text
 config/initializers/
   01_core_config.rb    ← runs first
   02_devise.rb         ← can safely depend on 01
@@ -735,7 +737,7 @@ Rails.application.config.filter_parameters += [
 
 Without this, passwords appear in plain text in log files:
 
-```
+```text
 # Unfiltered — security incident:
 Parameters: {"user"=>{"password"=>"mysecret123"}}
 
@@ -791,8 +793,6 @@ MAX_UPLOAD_SIZE   = 10.megabytes
 ```
 
 ---
-
-*Next up: Scopes, N+1 queries & eager loading*
 
 ---
 
@@ -998,7 +998,7 @@ Project.joins(:issues)
 
 Within a single request, Rails caches identical SQL queries. If the same query fires twice, the second hit returns instantly from memory — you'll see `CACHE` in the logs:
 
-```
+```text
 Issue Load (2.1ms)  SELECT "issues".* WHERE project_id IN (1,2,3)
 CACHE Issue Load (0.0ms)  SELECT "issues".* WHERE project_id IN (1,2,3)  ← free
 ```
@@ -1031,7 +1031,7 @@ Bullet will automatically warn you whenever an N+1 is detected during developmen
 
 Using our data as an example:
 
-```
+```text
 projects              issues
 --------              ------
 1  Alpha              1  Fix bug      project_id: 1
@@ -1085,7 +1085,7 @@ Every row from the left combined with every row from the right (cartesian produc
 
 ### Quick decision guide
 
-```
+```text
 Need all records even with no associations?  → LEFT OUTER JOIN
 Only want records that have associations?    → INNER JOIN
 Filtering/sorting by an associated column?   → INNER or LEFT OUTER JOIN
@@ -1187,7 +1187,7 @@ end
 
 ### The 3-deploy timeline
 
-```
+```text
 Deploy 1 → Step 1: add nullable column
            Old code: ignores column ✅  New code: writes to it ✅
 
@@ -1282,7 +1282,7 @@ If anything fails, the `ROLLBACK` undoes the entire migration — your schema is
 
 An exclusive lock from `ALTER TABLE` blocks ALL other queries against that table for the transaction's duration:
 
-```
+```text
 ALTER TABLE issues ADD COLUMN ...  ← exclusive lock acquired
   ← SELECT * FROM issues           → BLOCKED (user gets spinner)
   ← INSERT INTO issues ...         → BLOCKED
@@ -1352,7 +1352,7 @@ CREATE INDEX CONCURRENTLY index_issues_on_status ON issues (status)
 
 How PostgreSQL builds it in 3 passes:
 
-```
+```text
 Pass 1: Scan table, build initial index — normal writes still happen
 Pass 2: Catch up on changes made during pass 1
 Pass 3: Mark index as valid and ready to use
@@ -1506,7 +1506,7 @@ EXPLAIN ANALYZE
 SELECT * FROM issues WHERE project_id = 5 AND status = 0;
 ```
 
-```
+```text
 Bitmap Heap Scan on issues  (cost=4.50..28.62 rows=12 width=150)
                              (actual time=0.082..0.091 rows=5 loops=1)
   ->  Bitmap Index Scan on idx_issues_active_project
@@ -1628,7 +1628,7 @@ SQL
 
 Every Rails request needs a DB connection. PostgreSQL has a hard connection limit (typically 100–500). At scale you need a **connection pooler**:
 
-```
+```text
 Rails (Puma: 10 threads × 20 workers = 200 connections needed)
       ↓
   PgBouncer (connection pooler)
@@ -1680,4 +1680,559 @@ end
 
 ---
 
-*Next up: Testing with RSpec / Minitest*
+## 19. Foreign Keys, Database Locks & Constraint Patterns
+
+### 19.1 What `t.references` actually generates
+
+```ruby
+t.references :issue, null: false, foreign_key: true
+```
+
+This one line expands into **three separate database operations**:
+
+```sql
+-- 1. The column itself
+ALTER TABLE issue_labels ADD COLUMN issue_id bigint NOT NULL;
+
+-- 2. An index (automatic with t.references)
+CREATE INDEX index_issue_labels_on_issue_id ON issue_labels (issue_id);
+
+-- 3. The foreign key constraint (only with foreign_key: true)
+ALTER TABLE issue_labels
+  ADD CONSTRAINT fk_issue_labels_issue_id
+  FOREIGN KEY (issue_id) REFERENCES issues(id);
+```
+
+The longhand equivalent in a migration:
+
+```ruby
+t.bigint :issue_id, null: false
+add_index :issue_labels, :issue_id
+add_foreign_key :issue_labels, :issues
+```
+
+`null: false` and `foreign_key: true` are **completely independent**:
+
+- `null: false` → NOT NULL column constraint. Prevents `NULL` in the column. Always cheap at table creation time.
+- `foreign_key: true` → Referential integrity constraint. Prevents pointing to a non-existent row. This is the expensive, controversial one.
+
+---
+
+### 19.2 What a foreign key constraint enforces
+
+PostgreSQL enforces referential integrity at the database level — **even if you bypass Rails entirely** (raw psql, scripts, direct DB connections):
+
+```sql
+-- Will FAIL if issue_id 9999 does not exist in issues table
+INSERT INTO issue_labels (issue_id, label_id) VALUES (9999, 1);
+-- ERROR: insert or update on table "issue_labels" violates foreign key constraint
+
+-- Will FAIL if an issue_label still references this issue
+DELETE FROM issues WHERE id = 1;
+-- ERROR: update or delete on table "issues" violates foreign key constraint
+```
+
+In Rails, `belongs_to` presence validation catches the first case at the app layer, but DB constraints catch it everywhere else — including migrations, seeds, and scripts.
+
+---
+
+### 19.3 Foreign key tradeoffs — why GitLab omits them
+
+| | DB Foreign Key (`foreign_key: true`) | No FK (application-level only) |
+| --- | --- | --- |
+| **Referential integrity** | Guaranteed at DB level | Only if all writes go through Rails |
+| **Protection from raw SQL** | ✅ Yes | ❌ No |
+| **Write throughput overhead** | Slight — each write checks parent table | None |
+| **Migration safety on large tables** | Risky — takes locks during validation | No issue |
+| **Cross-database (decomposition)** | ❌ Impossible | ✅ Works |
+| **Orphaned records possible** | No | Yes, if app has bugs |
+| **`rails db:schema:load`** | FK constraints included | No FK constraints |
+
+GitLab's specific reasons:
+
+1. **Scale** — billions of rows; any full-table scan for constraint validation causes downtime
+2. **Cross-database decomposition** — CI tables live on a separate DB; FK constraints cannot span database boundaries
+3. **Write throughput** — on extremely write-heavy tables (CI pipelines, audit logs), the per-write parent check is measurable
+4. **Controlled access** — all DB writes go through the Rails app under strict review; raw DB writes are prohibited
+
+**For your app**: `foreign_key: true` is the right call. The protections outweigh the overhead at any sane scale.
+
+---
+
+### 19.4 PostgreSQL Lock Types
+
+PostgreSQL has **8 lock modes**, forming a conflict matrix. Every DDL and DML operation acquires one or more of these table-level locks:
+
+| Lock Mode | Acquired by | Conflicts with |
+| --- | --- | --- |
+| `ACCESS SHARE` | `SELECT` | `ACCESS EXCLUSIVE` only |
+| `ROW SHARE` | `SELECT FOR UPDATE/SHARE` | `EXCLUSIVE`, `ACCESS EXCLUSIVE` |
+| `ROW EXCLUSIVE` | `INSERT`, `UPDATE`, `DELETE` | `SHARE`, `SHARE ROW EXCLUSIVE`, `EXCLUSIVE`, `ACCESS EXCLUSIVE` |
+| `SHARE UPDATE EXCLUSIVE` | `VACUUM`, `ANALYZE`, `CREATE INDEX CONCURRENTLY` | `SHARE UPDATE EXCLUSIVE` and above |
+| `SHARE` | `CREATE INDEX` (non-concurrent) | `ROW EXCLUSIVE` and above |
+| `SHARE ROW EXCLUSIVE` | Constraint operations, `CREATE TRIGGER` | `ROW SHARE` and above |
+| `EXCLUSIVE` | Rare, explicit `LOCK TABLE ... EXCLUSIVE` | `ROW SHARE` and above |
+| `ACCESS EXCLUSIVE` | `ALTER TABLE`, `DROP TABLE`, `TRUNCATE`, `VACUUM FULL` | **Everything** — blocks all reads and writes |
+
+The three that matter most in production:
+
+**`ACCESS EXCLUSIVE`** — the most dangerous:
+
+```sql
+-- ALL of these take ACCESS EXCLUSIVE — they block every SELECT, INSERT, UPDATE, DELETE:
+ALTER TABLE issues ADD COLUMN author_name text;
+ALTER TABLE issue_labels ADD CONSTRAINT fk_... FOREIGN KEY (...) REFERENCES ...;
+DROP TABLE issues;
+TRUNCATE issues;
+VACUUM FULL issues;
+```
+
+**`SHARE`** — blocks writes but not reads:
+
+```sql
+-- Non-concurrent index creation: reads still work, writes are blocked
+CREATE INDEX index_issues_on_status ON issues (status);
+```
+
+**`SHARE UPDATE EXCLUSIVE`** — the "safe" lock for long-running operations:
+
+```sql
+-- Concurrent index creation: both reads AND writes continue normally
+CREATE INDEX CONCURRENTLY index_issues_on_status ON issues (status);
+```
+
+Row-level locks are separate and only affect individual rows, not the whole table:
+
+```sql
+SELECT * FROM issues WHERE id = 1 FOR UPDATE;  -- only locks that one row
+```
+
+---
+
+### 19.5 The lock queue problem
+
+Locks don't just block — they **queue**. This is the silent killer on busy tables:
+
+```text
+Time 0ms:   Long-running SELECT starts        → holds ACCESS SHARE
+Time 100ms: Your ALTER TABLE runs             → waits for ACCESS SHARE to finish
+Time 101ms: New SELECT comes in               → waits behind ALTER TABLE (!)
+Time 102ms: New INSERT comes in               → waits behind ALTER TABLE (!)
+...
+Time 30s:   ALTER TABLE times out             → lock_timeout exceeded
+            All queued queries also fail or time out
+```
+
+A single DDL statement waiting in the queue blocks **all subsequent queries** on that table, even lightweight SELECTs. This is why `lock_timeout` is critical:
+
+```ruby
+# GitLab always sets this before risky migrations
+execute "SET lock_timeout TO '5s'"
+execute "SET statement_timeout TO '70s'"
+add_index :issues, :status  # will FAIL FAST rather than queue up and cause cascade
+```
+
+---
+
+### 19.6 Lock contention from foreign key validation
+
+When you run `add_foreign_key` on a table with existing data:
+
+```ruby
+add_foreign_key :issue_labels, :issues
+```
+
+PostgreSQL must:
+
+1. Take `SHARE ROW EXCLUSIVE` on `issue_labels` — blocks all writes
+2. Take `SHARE ROW EXCLUSIVE` on `issues` — blocks all writes
+3. **Scan the entire `issue_labels` table** to verify every `issue_id` exists in `issues`
+4. Only then release both locks
+
+On a table with 500M rows, step 3 takes minutes. During those minutes, **nothing can write to either table**.
+
+---
+
+### 19.7 The `NOT VALID` + `VALIDATE CONSTRAINT` pattern
+
+PostgreSQL's solution: **split constraint creation into two steps** with completely different locking behaviors.
+
+**Step 1** — Add the constraint but skip the historical data scan:
+
+```ruby
+# Migration 1
+def change
+  add_foreign_key :issue_labels, :issues, validate: false
+  # Runs: ADD CONSTRAINT ... FOREIGN KEY ... NOT VALID
+end
+```
+
+`NOT VALID` means:
+
+- Constraint is created immediately (brief lock, no table scan)
+- **New inserts/updates are validated from this point forward** ✅
+- Existing rows are **not validated** — assumed to be clean from prior app-level checks
+
+Lock: `SHARE ROW EXCLUSIVE` held briefly (no scan = milliseconds, not minutes).
+
+**Step 2** — Validate the historical data separately (different deploy):
+
+```ruby
+# Migration 2
+def change
+  validate_foreign_key :issue_labels, :issues
+  # Runs: ALTER TABLE issue_labels VALIDATE CONSTRAINT fk_...
+end
+```
+
+`VALIDATE CONSTRAINT` does the full table scan but only acquires `SHARE UPDATE EXCLUSIVE` — which **does not block reads or writes**. Traffic continues normally during the scan.
+
+Full safe pattern in Rails:
+
+```ruby
+# Step 1: Add constraint as NOT VALID — brief lock, deploy 1
+class AddFkIssueLabelsToIssues < ActiveRecord::Migration[8.1]
+  def change
+    add_foreign_key :issue_labels, :issues, validate: false
+  end
+end
+
+# Step 2: Validate — long scan, but zero-impact, deploy 2
+class ValidateFkIssueLabelsToIssues < ActiveRecord::Migration[8.1]
+  disable_ddl_transaction!  # VALIDATE CONSTRAINT cannot run inside a transaction
+
+  def change
+    validate_foreign_key :issue_labels, :issues
+  end
+end
+```
+
+Why `disable_ddl_transaction!` on step 2? PostgreSQL cannot hold `SHARE UPDATE EXCLUSIVE` across a transaction boundary — the lock would be released on commit before the scan finished. The migration must run outside a transaction to keep the lock for the full duration.
+
+---
+
+### 19.8 Lock comparison — naive vs NOT VALID
+
+| Approach | Lock held during scan | Blocks reads? | Blocks writes? | Downtime risk |
+| --- | --- | --- | --- | --- |
+| `add_foreign_key` (naive) | `SHARE ROW EXCLUSIVE` for full scan duration | ❌ No | ✅ Yes (minutes) | HIGH |
+| `NOT VALID` step 1 | `SHARE ROW EXCLUSIVE` (milliseconds, no scan) | ❌ No | Briefly | LOW |
+| `VALIDATE CONSTRAINT` step 2 | `SHARE UPDATE EXCLUSIVE` (full scan duration) | ❌ No | ❌ No | NONE |
+| No FK at all | N/A | N/A | N/A | None |
+
+---
+
+### 19.9 The `NOT NULL` via check constraint trick
+
+Adding `NOT NULL` to an existing column with data has the same problem — PostgreSQL needs `ACCESS EXCLUSIVE` and a full scan:
+
+```ruby
+# DANGEROUS on large tables:
+change_column_null :issues, :author_name, false
+# Runs: ALTER TABLE issues ALTER COLUMN author_name SET NOT NULL
+# Takes ACCESS EXCLUSIVE + full scan — blocks everything
+```
+
+The safe alternative uses a check constraint with the same `NOT VALID` pattern:
+
+```ruby
+# Step 1: Add check constraint as NOT VALID (brief lock)
+add_check_constraint :issues,
+  "author_name IS NOT NULL",
+  name: "check_issues_author_name_not_null",
+  validate: false
+
+# Step 2: Validate (zero-impact full scan)
+class ValidateAuthorNameNotNull < ActiveRecord::Migration[8.1]
+  disable_ddl_transaction!
+  def change
+    validate_check_constraint :issues, name: "check_issues_author_name_not_null"
+  end
+end
+
+# Step 3: Now safe to set NOT NULL — PostgreSQL sees the validated check constraint
+# and skips the scan (it already knows all rows comply)
+change_column_null :issues, :author_name, false
+remove_check_constraint :issues, name: "check_issues_author_name_not_null"
+```
+
+PostgreSQL 12+ is smart enough to recognize that a validated check constraint proves NOT NULL safety, so the final `SET NOT NULL` is near-instant.
+
+---
+
+### 19.10 Common constraint types and their lock behavior
+
+| Constraint | How to add safely | Lock type | Blocks writes? |
+| --- | --- | --- | --- |
+| `NOT NULL` | Check constraint + `NOT VALID` + `VALIDATE` | `SHARE UPDATE EXCLUSIVE` during validate | ❌ No |
+| `FOREIGN KEY` | `NOT VALID` + `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` during validate | ❌ No |
+| `CHECK` | `NOT VALID` + `VALIDATE CONSTRAINT` | `SHARE UPDATE EXCLUSIVE` during validate | ❌ No |
+| `UNIQUE` | `CREATE UNIQUE INDEX CONCURRENTLY` + `ADD CONSTRAINT USING INDEX` | `SHARE UPDATE EXCLUSIVE` | ❌ No |
+| `DEFAULT` (PG 11+) | `ALTER COLUMN SET DEFAULT` | `ACCESS EXCLUSIVE` (brief, no rewrite) | Briefly |
+| `DEFAULT` (stored/computed) | Requires table rewrite | `ACCESS EXCLUSIVE` + rewrite | ✅ Yes (long) |
+
+---
+
+#### Next up: Testing with RSpec / Minitest
+
+---
+
+## 20. Migration Methods — `change` vs `up`/`down`
+
+### The core difference
+
+Every migration has one job: transform the schema. Rails gives you two ways to define that job:
+
+- **`change`** — you describe the transformation once; Rails figures out how to reverse it automatically
+- **`up` / `down`** — you describe both directions explicitly; Rails runs `up` on `db:migrate` and `down` on `db:rollback`
+
+```ruby
+# change — Rails infers the reverse
+def change
+  add_column :issues, :author_name, :string
+  # Rails knows the reverse is: remove_column :issues, :author_name
+end
+
+# up/down — you define both directions yourself
+def up
+  add_column :issues, :author_name, :string
+end
+
+def down
+  remove_column :issues, :author_name
+end
+```
+
+For simple structural changes they are equivalent. The difference only matters when **Rails can't automatically infer the reverse**.
+
+---
+
+### How `change` works internally — reversible commands
+
+Rails maintains an internal list of "reversible" migration commands. When you run `db:rollback`, it walks your `change` method **in reverse order** and calls the inverse of each command:
+
+| Forward command | Auto-inferred reverse |
+| --- | --- |
+| `create_table` | `drop_table` |
+| `drop_table` | ❌ Cannot infer (needs original column definitions) |
+| `add_column` | `remove_column` |
+| `remove_column` | ❌ Cannot infer (needs original type) |
+| `rename_column` | `rename_column` (swaps names) |
+| `rename_table` | `rename_table` (swaps names) |
+| `add_index` | `remove_index` |
+| `remove_index` | ❌ Cannot infer (needs original definition) |
+| `add_reference` | `remove_reference` |
+| `add_foreign_key` | `remove_foreign_key` |
+| `change_column_null` | `change_column_null` (with opposite boolean) |
+| `change_column_default` | ❌ Cannot infer (needs original default value) |
+| `change_column` | ❌ Cannot infer (needs original type) |
+| `enable_extension` | `disable_extension` |
+
+If you call a non-reversible command inside `change`, Rails raises `ActiveRecord::IrreversibleMigration` at rollback time — **not** at migration time.
+
+---
+
+### In our project — where each was used and why
+
+**`change` — used for all structural migrations:**
+
+```ruby
+# 20260322102554_create_projects.rb
+def change
+  create_table :projects do |t|
+    t.string :name, null: false
+    t.text :description
+    t.timestamps
+  end
+end
+```
+
+`create_table` is fully reversible — Rails knows the reverse is `drop_table :projects`. Safe to use `change`.
+
+```ruby
+# 20260323144818_add_author_name_to_issues.rb
+def change
+  add_column :issues, :author_name, :string
+end
+```
+
+`add_column` is reversible — Rails knows the reverse is `remove_column :issues, :author_name`. Safe to use `change`.
+
+---
+
+**`up`/`down` — used for the backfill migration:**
+
+```ruby
+# 20260323144942_backfill_author_name_on_issues.rb
+def up
+  issue_relation = define_model("issues", :author_name, :id)
+  issue_relation.where(author_name: nil).in_batches(of: 1000) do |batch|
+    batch.update_all(author_name: "unknown")
+  end
+end
+
+def down
+  # Reversing a backfill is a no-op — we don't want to re-NULL the column
+end
+```
+
+A data backfill is **not a structural change** — it's a `UPDATE` statement. Rails has no mechanism to reverse arbitrary data manipulation. `up`/`down` is the only option, and `down` is intentionally a no-op because there's nothing meaningful to undo.
+
+---
+
+**`up`/`down` — used for the NOT NULL constraint migration:**
+
+```ruby
+# 20260323145039_add_not_null_to_issues_author_name.rb
+def up
+  change_column_null :issues, :author_name, false
+end
+
+def down
+  change_column_null :issues, :author_name, true
+end
+```
+
+`change_column_null` **is** reversible — Rails can infer the reverse. But we used `up`/`down` here for **clarity**: the migration has a comment block explaining the NOT VALID pattern alternative. When a migration is complex enough to warrant explanation, being explicit about both directions makes the intent clearer, even if `change` would technically work.
+
+---
+
+### When you MUST use `up`/`down`
+
+#### 1. Data migrations (DML inside migrations)
+
+```ruby
+# Any INSERT, UPDATE, DELETE — Rails cannot reverse data changes
+def up
+  execute "UPDATE issues SET status = 1 WHERE status = 0 AND created_at < '2024-01-01'"
+end
+
+def down
+  # Can't know which rows were changed — no-op or compensating update
+end
+```
+
+#### 2. `remove_column` with existing data you care about
+
+```ruby
+# change would work for rollback syntax, but you'd lose the type info
+# Being explicit is safer:
+def up
+  remove_column :issues, :legacy_field
+end
+
+def down
+  add_column :issues, :legacy_field, :string, default: "n/a"
+end
+```
+
+#### 3. `change_column` (type change)
+
+```ruby
+# change_column is NOT reversible — Rails doesn't know the original type
+def up
+  change_column :issues, :priority, :integer, using: "priority::integer"
+end
+
+def down
+  change_column :issues, :priority, :string
+end
+```
+
+#### 4. `drop_table`
+
+```ruby
+# drop_table in change works IF you supply the block (Rails stores the schema)
+# But it's clearer and safer with up/down:
+def up
+  drop_table :legacy_tokens
+end
+
+def down
+  create_table :legacy_tokens do |t|
+    t.string :value, null: false
+    t.references :user, foreign_key: true
+    t.timestamps
+  end
+end
+```
+
+#### 5. `execute` with raw SQL
+
+```ruby
+# Raw SQL is always up/down — Rails has no idea what it does
+def up
+  execute "CREATE INDEX CONCURRENTLY ..."
+end
+
+def down
+  execute "DROP INDEX ..."
+end
+```
+
+#### 6. Custom logic / conditional migrations
+
+```ruby
+def up
+  if column_exists?(:issues, :old_status)
+    rename_column :issues, :old_status, :status
+  else
+    add_column :issues, :status, :integer, default: 0
+  end
+end
+
+def down
+  rename_column :issues, :status, :old_status
+end
+```
+
+---
+
+### The `reversible` escape hatch
+
+When most of your `change` method is reversible but one part isn't, you can use `reversible` instead of splitting into `up`/`down`:
+
+```ruby
+def change
+  add_column :issues, :priority, :integer, default: 0
+
+  reversible do |dir|
+    dir.up   { execute "UPDATE issues SET priority = 1 WHERE status = 'open'" }
+    dir.down { } # no-op
+  end
+
+  add_index :issues, :priority
+end
+```
+
+This keeps the migration readable while handling the non-reversible part explicitly.
+
+---
+
+### Decision guide
+
+```text
+Is every command in the migration on the "reversible" list above?
+  YES → use change. Simple, concise, Rails handles rollback for you.
+  NO  → use up/down, or use change + reversible block for the non-reversible parts.
+
+Does the migration touch data (INSERT/UPDATE/DELETE)?
+  YES → always use up/down. down is usually a no-op or compensating update.
+
+Is the migration intentionally irreversible (e.g. dropping a column permanently)?
+  YES → use up/down. In down, either raise ActiveRecord::IrreversibleMigration
+        or leave it as a no-op with a comment explaining why.
+```
+
+Raising explicitly in `down` is better than a silent no-op when rollback truly isn't possible:
+
+```ruby
+def down
+  raise ActiveRecord::IrreversibleMigration,
+    "Cannot restore dropped data — restore from backup if needed"
+end
+```
+
+---
+
+#### Next up: Testing with RSpec / Minitest (Section 21)
