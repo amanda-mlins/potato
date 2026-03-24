@@ -15,7 +15,7 @@ class IssuesController < ApplicationController
     if @issue.save
       redirect_to @issue, notice: "Issue was successfully created."
     else
-      render :new, status: :unprocessable_entity
+      render :new, status: :unprocessable_content
     end
   end
 
@@ -26,7 +26,7 @@ class IssuesController < ApplicationController
     if @issue.update(issue_params)
       redirect_to @issue, notice: "Issue was successfully updated."
     else
-      render :edit, status: :unprocessable_entity
+      render :edit, status: :unprocessable_content
     end
   end
 
@@ -46,6 +46,6 @@ class IssuesController < ApplicationController
   end
 
   def issue_params
-    params.require(:issue).permit(:title, :description, :status)
+    params.require(:issue).permit(:title, :description, :status, :author_name)
   end
 end

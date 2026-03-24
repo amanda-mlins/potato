@@ -6,6 +6,7 @@ class Issue < ApplicationRecord
   enum :status, { open: 0, in_progress: 1, closed: 2 }
 
   validates :title, presence: true, length: { maximum: 255 }
+  validates :author_name, presence: true
   validates :description, length: { maximum: 1000 }
   validates :status, presence: true
 

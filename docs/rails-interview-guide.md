@@ -28,6 +28,7 @@
 18. [PostgreSQL Deep Dive](#18-postgresql-deep-dive)
 19. [Foreign Keys, Database Locks & Constraint Patterns](#19-foreign-keys-database-locks--constraint-patterns)
 20. [Migration Methods — `change` vs `up`/`down`](#20-migration-methods--change-vs-updown)
+21. [Testing with RSpec — The GitLab Way](#21-testing-with-rspec--the-gitlab-way)
 
 ---
 
@@ -2236,3 +2237,398 @@ end
 ---
 
 #### Next up: Testing with RSpec / Minitest (Section 21)
+
+---
+
+## 21. Testing with RSpec — The GitLab Way
+
+GitLab uses **RSpec** exclusively for backend testing (no Minitest). Their stack:
+
+| Tool | Role |
+| ---- | ---- |
+| `rspec-rails` | Test framework |
+| `factory_bot_rails` | Test data (factories, not fixtures) |
+| `shoulda-matchers` | One-liner validation/association assertions |
+| `database_cleaner-active_record` | DB isolation between tests |
+| `capybara` + `selenium-webdriver` | System/feature specs |
+
+### Gem setup
+
+```ruby
+# Gemfile
+group :test do
+  gem "rspec-rails"
+  gem "factory_bot_rails"
+  gem "shoulda-matchers"
+  gem "database_cleaner-active_record"
+  gem "capybara"
+  gem "selenium-webdriver"
+end
+```
+
+Bootstrap RSpec after installing:
+
+```bash
+bundle exec rails generate rspec:install
+# Creates: .rspec, spec/spec_helper.rb, spec/rails_helper.rb
+```
+
+---
+
+### `spec/rails_helper.rb` configuration
+
+```ruby
+require 'spec_helper'
+require 'rspec/rails'
+require 'shoulda/matchers'
+require 'database_cleaner/active_record'
+
+RSpec.configure do |config|
+  config.infer_spec_type_from_file_location!
+  config.filter_rails_from_backtrace!
+
+  # FactoryBot shorthand — call create(), build(), etc. directly
+  config.include FactoryBot::Syntax::Methods
+
+  # DatabaseCleaner — transaction strategy (fast, no TRUNCATE)
+  config.use_transactional_fixtures = false
+
+  config.before(:suite) do
+    DatabaseCleaner.strategy = :transaction
+    DatabaseCleaner.clean_with(:truncation) # wipe once before suite
+  end
+
+  config.around(:each) do |example|
+    DatabaseCleaner.cleaning { example.run }
+  end
+end
+
+Shoulda::Matchers.configure do |config|
+  config.integrate do |with|
+    with.test_framework :rspec
+    with.library :rails
+  end
+end
+```
+
+**Why `use_transactional_fixtures = false`?**
+DatabaseCleaner owns the transaction lifecycle. Each example runs inside a transaction that is rolled back — so data is isolated without truncating tables. This means **primary key sequences are NOT reset** between specs (IDs keep incrementing). Never rely on a specific ID value in a test.
+
+---
+
+### Directory layout
+
+```text
+spec/
+  factories/          # FactoryBot definitions (one file per model)
+    projects.rb
+    issues.rb
+    labels.rb
+  models/             # Unit tests — fast, no HTTP
+    project_spec.rb
+    issue_spec.rb
+    label_spec.rb
+  requests/           # HTTP-level integration tests (GitLab preference over controller specs)
+    projects_spec.rb
+    issues_spec.rb
+  support/            # Shared helpers, custom matchers, configs (auto-required)
+  rails_helper.rb
+  spec_helper.rb
+```
+
+GitLab uses `spec/` (not `test/`), `*_spec.rb` files (not `*_test.rb`).
+
+---
+
+### FactoryBot factories
+
+Factories are the GitLab alternative to fixtures. One top-level factory per file, named after the model's plural.
+
+```ruby
+# spec/factories/projects.rb
+FactoryBot.define do
+  factory :project do
+    sequence(:name) { |n| "Project #{n}" }  # unique across test run
+    description { "A test project" }
+  end
+end
+
+# spec/factories/issues.rb
+FactoryBot.define do
+  factory :issue do
+    sequence(:title) { |n| "Issue #{n}" }
+    status { :open }
+    author_name { "Test Author" }
+    association :project          # belongs_to wired automatically
+  end
+end
+
+# spec/factories/labels.rb
+FactoryBot.define do
+  factory :label do
+    sequence(:name) { |n| "Label #{n}" }
+    color { "#ff0000" }
+
+    trait :blue  { color { "#0000ff" } }  # traits keep factories lean
+    trait :green { color { "#00ff00" } }
+  end
+end
+```
+
+**Key rules (from GitLab docs):**
+
+- Only define attributes required for the record to be **valid** — nothing extra.
+- Only supply attributes actually **needed by the test** when calling `create`.
+- Use `association` (not `create`/`build` inside factories) for `belongs_to`.
+- Use **traits** to vary behaviour, not multiple factory definitions.
+
+**Factory methods and cost (slowest → fastest):**
+
+```ruby
+create(:project)         # Saves to DB — use only when persistence is needed
+build(:project)          # In-memory, not saved — faster, use for unit tests
+build_stubbed(:project)  # Fake AR object, no DB at all — fastest
+attributes_for(:project) # Plain hash of attributes — for params
+```
+
+---
+
+### Model specs
+
+**GitLab conventions:**
+
+- Single top-level `RSpec.describe ClassName` (no `do ... end` nesting outside it).
+- Use `.method` for class methods, `#method` for instance methods in descriptions.
+- Use `context` for branching logic ("when X", "with Y").
+- Use `described_class` instead of hardcoding the class name.
+- `subject` for the thing under test; avoid anonymous `subject` — use named subjects.
+
+```ruby
+# spec/models/project_spec.rb
+RSpec.describe Project do
+  # Shoulda::Matchers — one-liner assertions
+  describe 'associations' do
+    it { is_expected.to have_many(:issues).dependent(:destroy) }
+  end
+
+  describe 'validations' do
+    it { is_expected.to validate_presence_of(:name) }
+    it { is_expected.to validate_length_of(:name).is_at_most(255) }
+  end
+
+  describe 'factory' do
+    it 'has a valid factory' do
+      expect(build(:project)).to be_valid
+    end
+  end
+
+  describe 'dependent: :destroy' do
+    let(:project) { create(:project) }
+    let!(:issue)  { create(:issue, project: project) }   # let! = eager, created before example
+
+    it 'destroys associated issues when deleted' do
+      expect { project.destroy }.to change(Issue, :count).by(-1)
+    end
+  end
+end
+```
+
+---
+
+### `let` vs `let!` vs `let_it_be`
+
+| Helper | Created | Shared between examples? | GitLab recommendation |
+| ------ | ------- | ------------------------ | --------------------- |
+| `let` | Lazily, on first reference | No (new each example) | Default choice |
+| `let!` | Eagerly, before each example | No (new each example) | When side effects must happen before `it` |
+| `let_it_be` | Once, before all examples in context | Yes (read-only) | GitLab default for DB objects (needs `test-prof` gem) |
+| `let_it_be_with_reload` | Once | Yes, reloaded after each | When the example modifies the object |
+
+At GitLab's scale, `let_it_be` (from the [`test-prof`](https://github.com/test-prof/test-prof) gem) dramatically speeds up tests by creating DB objects once per context instead of once per example. For this app, plain `let` is fine.
+
+---
+
+### Enum specs
+
+```ruby
+describe 'status enum' do
+  subject(:issue) { build(:issue) }
+
+  it 'defaults to open' do
+    expect(issue.status).to eq('open')
+  end
+
+  it 'raises on an invalid value' do
+    expect { issue.status = :unknown }.to raise_error(ArgumentError)
+  end
+
+  context 'when set to closed' do
+    let(:persisted_issue) { create(:issue) }
+
+    before { persisted_issue.closed! }  # bang method persists, needs DB
+
+    it 'is closed' do
+      expect(persisted_issue).to be_closed
+    end
+  end
+end
+```
+
+**Note:** Test enum **behaviour** (predicates, transitions) not constant values. Testing that `Issue.statuses[:open] == 0` just duplicates the code.
+
+---
+
+### Scope specs
+
+```ruby
+describe '.recent' do
+  let(:project) { create(:project) }
+
+  it 'orders issues by created_at descending' do
+    older = create(:issue, project: project, created_at: 2.days.ago)
+    newer = create(:issue, project: project, created_at: 1.day.ago)
+
+    expect(Issue.recent).to eq([newer, older])
+  end
+end
+
+describe '.with_labels' do
+  it 'eager loads labels to avoid N+1 queries' do
+    result = Issue.with_labels.find(issue.id)
+
+    # Assert association is already loaded — no extra query fired
+    expect(result.association(:labels)).to be_loaded
+  end
+end
+```
+
+---
+
+### Request specs (GitLab's preferred integration test)
+
+GitLab uses **request specs** over controller specs. Request specs exercise the full stack: routing → middleware → controller → response.
+
+```ruby
+# spec/requests/projects_spec.rb
+RSpec.describe 'Projects', type: :request do
+  let(:project) { create(:project) }
+
+  describe 'GET /projects' do
+    it 'returns HTTP 200' do
+      get projects_path
+
+      expect(response).to have_http_status(:ok)
+    end
+  end
+
+  describe 'POST /projects' do
+    context 'with valid parameters' do
+      let(:valid_params) { { project: { name: 'My Project' } } }
+
+      it 'creates a new project' do
+        expect { post projects_path, params: valid_params }.to change(Project, :count).by(1)
+      end
+
+      it 'redirects to the new project' do
+        post projects_path, params: valid_params
+
+        expect(response).to redirect_to(project_path(Project.last))
+      end
+    end
+
+    context 'with invalid parameters' do
+      it 'returns HTTP 422' do
+        post projects_path, params: { project: { name: '' } }
+
+        expect(response).to have_http_status(:unprocessable_content)
+      end
+    end
+  end
+
+  describe 'DELETE /projects/:id' do
+    it 'destroys the project' do
+      project_to_delete = create(:project)
+
+      expect { delete project_path(project_to_delete) }.to change(Project, :count).by(-1)
+    end
+  end
+end
+```
+
+**Do not use** `render_template` in request specs — that requires the `rails-controller-testing` gem which GitLab discourages. Assert on status codes and response body content instead.
+
+---
+
+### Shoulda::Matchers cheatsheet
+
+```ruby
+# Associations
+it { is_expected.to belong_to(:project) }
+it { is_expected.to have_many(:issues).dependent(:destroy) }
+it { is_expected.to have_many(:labels).through(:issue_labels) }
+
+# Validations
+it { is_expected.to validate_presence_of(:name) }
+it { is_expected.to validate_length_of(:name).is_at_most(255) }
+it { is_expected.to validate_uniqueness_of(:email) }
+it { is_expected.to validate_numericality_of(:position).is_greater_than(0) }
+```
+
+These replace verbose multi-line tests and are highly readable in diffs.
+
+---
+
+### Four-Phase Test pattern
+
+GitLab follows the [Four-Phase Test](https://thoughtbot.com/blog/four-phase-test) pattern with blank lines separating phases:
+
+```ruby
+it 'removes the issue from the project' do
+  # Setup
+  project = create(:project)
+  issue   = create(:issue, project: project)
+
+  # Exercise
+  issue.destroy
+
+  # Verify
+  expect(project.issues.reload).to be_empty
+
+  # Teardown — handled automatically by DatabaseCleaner
+end
+```
+
+---
+
+### Running specs
+
+```bash
+bundle exec rspec                           # run all specs
+bundle exec rspec spec/models/project_spec.rb        # single file
+bundle exec rspec spec/models/project_spec.rb:45     # specific line
+bundle exec rspec spec/models/ spec/requests/        # multiple dirs
+bundle exec rspec --format documentation             # verbose output
+bundle exec rspec --profile                          # show 10 slowest examples
+```
+
+---
+
+### Interview Q&A
+
+**Q: Why RSpec over Minitest?**
+RSpec's DSL (`describe`/`context`/`it`) reads like a specification, making test intent clear at a glance. GitLab chose it for its expressiveness, rich matcher library, shared examples, and metadata system (tags like `:js`, `:sidekiq_inline`). Minitest is faster to boot but harder to read at scale.
+
+**Q: Why FactoryBot over fixtures?**
+Fixtures are static YAML — they don't adapt to schema changes, they ignore validations, and they load all data regardless of what the test needs. FactoryBot creates only what the test requires, respects validations, supports traits for variations, and is far easier to maintain.
+
+**Q: What's the difference between `build` and `create`?**
+`build` constructs an in-memory object without touching the DB. `create` persists it. Use `build` whenever you don't need DB persistence — it's faster and reduces coupling. Use `create` when the test exercises DB queries, associations, or scopes.
+
+**Q: Why use DatabaseCleaner with the transaction strategy?**
+Each test runs inside a DB transaction that is rolled back at the end. This is faster than truncating tables and restores the DB to a pristine state without resetting sequences. The downside: since primary key sequences aren't reset, you must never assert on specific ID values.
+
+**Q: What's `let_it_be` and when would you use it?**
+`let_it_be` (from the `test-prof` gem) creates a DB record once for all examples in a context, rather than once per example like `let`. After each example, changes are rolled back, and the object is reloaded. At GitLab's scale this dramatically reduces DB writes. Use it for objects that don't change between examples; use `let_it_be_with_reload` if the example modifies the object.
+
+**Q: Request spec vs controller spec — what's the difference?**
+Controller specs bypass routing and middleware, hitting the controller action directly. Request specs go through the full Rack stack (routing → middleware → controller → view → response). GitLab deprecated controller specs in favour of request specs because request specs give higher confidence and closer match to real HTTP behaviour.
