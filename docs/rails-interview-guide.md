@@ -2287,15 +2287,13 @@ RSpec.configure do |config|
   config.infer_spec_type_from_file_location!
   config.filter_rails_from_backtrace!
 
-  # FactoryBot shorthand — call create(), build(), etc. directly
   config.include FactoryBot::Syntax::Methods
 
-  # DatabaseCleaner — transaction strategy (fast, no TRUNCATE)
   config.use_transactional_fixtures = false
 
   config.before(:suite) do
     DatabaseCleaner.strategy = :transaction
-    DatabaseCleaner.clean_with(:truncation) # wipe once before suite
+    DatabaseCleaner.clean_with(:truncation)
   end
 
   config.around(:each) do |example|
@@ -2311,8 +2309,198 @@ Shoulda::Matchers.configure do |config|
 end
 ```
 
-**Why `use_transactional_fixtures = false`?**
-DatabaseCleaner owns the transaction lifecycle. Each example runs inside a transaction that is rolled back — so data is isolated without truncating tables. This means **primary key sequences are NOT reset** between specs (IDs keep incrementing). Never rely on a specific ID value in a test.
+#### `config.infer_spec_type_from_file_location!`
+
+RSpec needs to know what *type* of spec it is running so it can load the right helpers. Without this setting you would have to tag every single file manually:
+
+```ruby
+# without infer — you have to write this on every file
+RSpec.describe Project, type: :model do …
+RSpec.describe "Projects", type: :request do …
+```
+
+With `infer_spec_type_from_file_location!` RSpec reads the path and sets `type` automatically:
+
+| File location | Inferred `type` | What it unlocks |
+| --- | --- | --- |
+| `spec/models/` | `:model` | ActiveRecord helpers |
+| `spec/requests/` | `:request` | `get`, `post`, `response` helpers |
+| `spec/controllers/` | `:controller` | `assigns`, `render_template` |
+| `spec/helpers/` | `:helper` | view helper methods |
+| `spec/system/` | `:system` | Capybara DSL |
+| `spec/mailers/` | `:mailer` | mail delivery matchers |
+
+**Practical effect**: you can write `RSpec.describe Project do` (no `type:`) and everything works as long as the file lives in the right folder. This matches GitLab's convention — no manual type tags.
+
+#### `config.filter_rails_from_backtrace!`
+
+When a test fails, Ruby prints a stack trace. Without this filter, the output includes dozens of internal Rails and gem frames that are irrelevant to your code:
+
+```text
+# Without filter_rails_from_backtrace!
+Failure/Error: expect(project).to be_valid
+  /Users/alins/.rbenv/gems/rspec-core-3.13/lib/rspec/core/example.rb:458:in `run'
+  /Users/alins/.rbenv/gems/activerecord-8.1/lib/active_record/validations.rb:80:in `valid?'
+  /Users/alins/.rbenv/gems/rspec-rails-8.0/lib/rspec/rails/matchers/be_valid.rb:14:in `matches?'
+  spec/models/project_spec.rb:12:in `block (3 levels) in <top>'  # ← the line you care about
+```
+
+```text
+# With filter_rails_from_backtrace!
+Failure/Error: expect(project).to be_valid
+  spec/models/project_spec.rb:12:in `block (3 levels) in <top>'  # ← only your code
+```
+
+Rails, RSpec, and gem frames are suppressed. You see only the lines inside your `spec/` directory. The full backtrace is still available via `--backtrace` flag if you need it.
+
+#### `config.include FactoryBot::Syntax::Methods`
+
+FactoryBot ships with two APIs:
+
+```ruby
+# Verbose API — always works, no config needed
+FactoryBot.create(:project)
+FactoryBot.build(:project)
+FactoryBot.build_stubbed(:project)
+
+# Shorthand API — requires config.include FactoryBot::Syntax::Methods
+create(:project)
+build(:project)
+build_stubbed(:project)
+```
+
+`include FactoryBot::Syntax::Methods` mixes the shorthand methods into every RSpec example group so you can call `create` and `build` without the `FactoryBot.` prefix. This is the GitLab convention — all specs use the short form.
+
+#### `config.use_transactional_fixtures`
+
+This is the most important database-isolation setting and it interacts directly with DatabaseCleaner.
+
+**`use_transactional_fixtures = true` (Rails default)**
+
+Rails wraps each test in a database transaction and rolls it back after the test finishes. No data ever commits. The cycle looks like:
+
+```sql
+BEGIN;
+  -- your test runs
+ROLLBACK;
+```
+
+Advantages: very fast — no data actually hits disk between tests.
+
+Disadvantages:
+
+- Conflicts with DatabaseCleaner. Both systems try to own the transaction lifecycle and they fight each other — you get data leaking between specs or tests failing randomly.
+- Does not work with system/feature specs that open a real browser (Capybara). The browser makes HTTP requests through a separate thread or process that cannot see the open transaction, so it sees an empty database even though your test inserted data.
+
+**`use_transactional_fixtures = false` (our setting)**
+
+Rails does not manage transactions at all. DatabaseCleaner takes over completely. This is required whenever you use DatabaseCleaner.
+
+```sql
+-- DatabaseCleaner.cleaning do
+  BEGIN;
+    -- your test runs
+  ROLLBACK;
+-- end
+```
+
+Each example is wrapped by the `around(:each)` hook. When `example.run` returns, DatabaseCleaner rolls back the transaction — the DB is empty again for the next test.
+
+**Side effect to know**: primary key sequences (serial / bigserial in PostgreSQL) are NOT reset by a rollback. If you `create(:project)` in test 1 (ID = 1) and `create(:project)` in test 2 (ID = 2), the sequence keeps incrementing even though test 1's row was rolled back. **Never assert on a specific ID value** in a test. Use `project.id` rather than `1`.
+
+#### `config.before(:suite)` — DatabaseCleaner setup
+
+```ruby
+config.before(:suite) do
+  DatabaseCleaner.strategy = :transaction
+  DatabaseCleaner.clean_with(:truncation)
+end
+```
+
+This block runs **once** before the entire test suite starts. Two things happen:
+
+**`DatabaseCleaner.strategy = :transaction`**
+
+Sets the default cleanup strategy. `:transaction` means "wrap each example in a BEGIN/ROLLBACK". Alternatives:
+
+| Strategy | How it cleans | Speed | When to use |
+| --- | --- | --- | --- |
+| `:transaction` | ROLLBACK | Fastest | Unit/request specs (our default) |
+| `:truncation` | DELETE all rows from all tables | Slow | System/feature specs (browser) |
+| `:deletion` | DELETE FROM each table | Moderate | Rarely — when truncation breaks triggers |
+
+System specs that open a browser need `:truncation` because the browser runs in a separate thread. You can override the strategy for specific spec types:
+
+```ruby
+config.before(:each, type: :system) do
+  DatabaseCleaner.strategy = :truncation
+end
+```
+
+**`DatabaseCleaner.clean_with(:truncation)`**
+
+Truncates every table once before the suite starts. This is a safety sweep — it wipes any data left over from a previous test run that crashed without cleaning up (e.g., you killed the process mid-run). `:truncation` is used here specifically because the suite hasn't started yet — there is no open transaction to roll back.
+
+#### `config.around(:each)` — per-example cleaning
+
+```ruby
+config.around(:each) do |example|
+  DatabaseCleaner.cleaning { example.run }
+end
+```
+
+`around(:each)` runs a block for every single example. `DatabaseCleaner.cleaning` is a convenience wrapper that:
+
+1. Starts a transaction (BEGIN)
+2. Runs the example (`example.run`)
+3. Rolls back (ROLLBACK)
+
+Using `around(:each)` rather than separate `before` and `after` hooks has one key advantage: the rollback still happens even if the test raises an exception. A bare `after(:each)` hook can be skipped on error in some configurations.
+
+The sequence for every spec:
+
+```text
+before(:suite)       ← once: set strategy, truncate
+  around(:each)      ← BEGIN
+    before(:each)    ← (any additional before hooks)
+    ← example runs →
+    after(:each)     ← (any additional after hooks)
+  around(:each)      ← ROLLBACK
+after(:suite)        ← (any suite-level teardown)
+```
+
+#### `Shoulda::Matchers.configure`
+
+```ruby
+Shoulda::Matchers.configure do |config|
+  config.integrate do |with|
+    with.test_framework :rspec
+    with.library :rails
+  end
+end
+```
+
+Shoulda::Matchers is a separate gem. It needs to know two things:
+
+**`with.test_framework :rspec`**
+
+Tells Shoulda to include its matchers into RSpec example groups (rather than Minitest). Without this, calling `should validate_presence_of(:name)` raises `NoMethodError`.
+
+Other valid values: `:minitest` (if you use Minitest).
+
+**`with.library :rails`**
+
+Loads all Rails-aware matchers: `validate_presence_of`, `validate_uniqueness_of`, `have_many`, `belong_to`, `have_db_column`, `permit_param`, etc. Without this only the basic Shoulda matchers load and all the ActiveRecord / ActiveModel matchers are missing.
+
+You can scope it narrower if you only want part of Rails:
+
+```ruby
+with.library :active_record    # only DB/model matchers
+with.library :active_model     # only validation matchers
+with.library :action_controller # only controller matchers
+```
+
+The combination of `test_framework :rspec` + `library :rails` is the standard setup and is what GitLab would use.
 
 ---
 
@@ -2390,6 +2578,22 @@ build(:project)          # In-memory, not saved — faster, use for unit tests
 build_stubbed(:project)  # Fake AR object, no DB at all — fastest
 attributes_for(:project) # Plain hash of attributes — for params
 ```
+
+**When to use each:**
+
+- Use `build` for validation tests — you only need the Ruby object to call `.valid?` and check `.errors`. No DB required.
+- Use `create` when the test fires a real query (scopes, `find`, HTTP controller actions), tests `dependent: :destroy`, or checks associations that require persisted records.
+- Never use `create` when `build` will do — every `create` is a DB write that slows the suite.
+
+**Implicit association creation:**
+
+```ruby
+factory :issue do
+  association :project   # belongs_to
+end
+```
+
+When you call `create(:issue)` without passing a project, FactoryBot automatically calls `create(:project)` behind the scenes. This is convenient but can create many hidden DB records at scale — which is why GitLab uses `FactoryDefault` and `let_it_be` to share parent objects across examples.
 
 ---
 
