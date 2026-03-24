@@ -2528,6 +2528,62 @@ GitLab uses `spec/` (not `test/`), `*_spec.rb` files (not `*_test.rb`).
 
 ---
 
+### `# frozen_string_literal: true`
+
+This is a **magic comment** that must appear on the very first line of a Ruby file (before any code, even `require` statements). It instructs the Ruby VM to freeze every string literal in that file at parse time.
+
+#### What "frozen" means
+
+In Ruby, strings are mutable objects by default — you can modify them in place:
+
+```ruby
+greeting = "hello"
+greeting << " world"  # mutates the original string
+puts greeting         # "hello world"
+```
+
+A frozen string raises `FrozenError` if you try to mutate it:
+
+```ruby
+greeting = "hello".freeze
+greeting << " world"  # FrozenError: can't modify frozen String
+```
+
+#### What the magic comment does
+
+```ruby
+# frozen_string_literal: true
+
+name = "Alice"
+name << "!"  # FrozenError — same as calling "Alice".freeze explicitly
+```
+
+Every string literal in the file is treated as if `.freeze` was called on it. It does **not** affect strings built at runtime (e.g., string interpolation creates a new unfrozen string):
+
+```ruby
+# frozen_string_literal: true
+
+base = "hello"
+result = "#{base} world"  # fine — interpolation produces a new string object
+```
+
+#### Why Ruby (and GitLab) uses it
+
+| Benefit | Detail |
+| --- | --- |
+| **Memory** | Identical frozen string literals can share the same object in memory. `"foo"` in 1000 files → 1 object instead of 1000. |
+| **Performance** | The VM skips allocating a new String object each time the literal is evaluated — it reuses the frozen one. |
+| **Safety** | Prevents accidental mutation of a string that is shared across multiple references (a subtle bug class). |
+| **Ruby 3 direction** | The Ruby core team has long planned to make frozen string literals the default. Using the comment now is forward-compatible. |
+
+GitLab's RuboCop ruleset enforces `frozen_string_literal: true` on every file via the `Style/FrozenStringLiteralComment` cop. That is why you see it at the top of every factory, spec, and model file in the project.
+
+#### Running without it
+
+If you omit the comment, strings are mutable (Ruby's current default). Your code still works — it is purely an optimisation and safety hint, not required for correctness.
+
+---
+
 ### FactoryBot factories
 
 Factories are the GitLab alternative to fixtures. One top-level factory per file, named after the model's plural.
@@ -2836,3 +2892,337 @@ Each test runs inside a DB transaction that is rolled back at the end. This is f
 
 **Q: Request spec vs controller spec — what's the difference?**
 Controller specs bypass routing and middleware, hitting the controller action directly. Request specs go through the full Rack stack (routing → middleware → controller → view → response). GitLab deprecated controller specs in favour of request specs because request specs give higher confidence and closer match to real HTTP behaviour.
+
+---
+
+## 22. Ruby Particularities — Truthiness, Identity & Gotchas
+
+Ruby's rules are simple but different enough from other languages to trip you up in an interview.
+
+---
+
+### Truthiness — what is truthy and what is falsy?
+
+Ruby has exactly **two falsy values**: `nil` and `false`. Everything else is truthy — no exceptions.
+
+| Value | Truthy? | Notes |
+| --- | --- | --- |
+| `nil` | **falsy** | The only "nothing" value in Ruby |
+| `false` | **falsy** | The boolean false |
+| `0` | **truthy** | Unlike C, JavaScript, Python |
+| `0.0` | **truthy** | Same — all numbers are truthy |
+| `""` | **truthy** | Unlike Python — empty string is truthy |
+| `"0"` | **truthy** | A non-empty string |
+| `[]` | **truthy** | Unlike Python — empty array is truthy |
+| `{}` | **truthy** | Unlike Python — empty hash is truthy |
+| `true` | truthy | |
+| Any object | truthy | Including `0`, `""`, `[]`, `{}` |
+
+```ruby
+puts "truthy" if 0        # prints "truthy"
+puts "truthy" if ""       # prints "truthy"
+puts "truthy" if []       # prints "truthy"
+puts "truthy" if {}       # prints "truthy"
+puts "truthy" if "false"  # prints "truthy" — it's a non-empty string!
+
+puts "truthy" if nil      # nothing — nil is falsy
+puts "truthy" if false    # nothing — false is falsy
+```
+
+**Interview tip**: JavaScript developers get burned by `0` and `""` being falsy in JS but truthy in Ruby. Python developers get burned by `[]` and `{}` being falsy in Python but truthy in Ruby.
+
+---
+
+### `nil?`, `blank?`, `present?`, `empty?`
+
+Ruby and Rails offer several ways to check "emptiness" — they are not the same:
+
+| Method | Defined by | Returns true when |
+| --- | --- | --- |
+| `nil?` | Ruby (all objects) | only if the receiver IS `nil` |
+| `empty?` | Ruby (String, Array, Hash) | collection has zero elements |
+| `blank?` | Rails (ActiveSupport) | `nil`, `false`, whitespace-only string, empty collection |
+| `present?` | Rails (ActiveSupport) | opposite of `blank?` |
+
+```ruby
+nil.nil?        # => true
+"".nil?         # => false   ← "" is NOT nil
+0.nil?          # => false
+
+"".empty?       # => true
+[].empty?       # => true
+" ".empty?      # => false   ← space is not empty
+
+nil.blank?      # => true
+false.blank?    # => true
+"".blank?       # => true
+"  ".blank?     # => true    ← whitespace-only is blank
+[].blank?       # => true
+0.blank?        # => false   ← 0 is NOT blank
+"hi".blank?     # => false
+
+nil.present?    # => false
+"hi".present?   # => true
+"  ".present?   # => false   ← whitespace-only is not present
+```
+
+**When to use which:**
+
+- `nil?` — you specifically want to check for `nil` and nothing else
+- `empty?` — pure Ruby, no Rails dependency, you know the type is a String/Array/Hash
+- `blank?` — Rails code where the value could be `nil`, `false`, or a whitespace string (e.g., form params)
+- `present?` — common guard in controllers: `if params[:query].present?`
+
+---
+
+### `==`, `eql?`, `equal?` — value equality vs object identity
+
+Ruby has three equality methods and they mean different things:
+
+| Method | Checks | Example |
+| --- | --- | --- |
+| `==` | Value equality (can be overridden) | `1 == 1.0` → `true` |
+| `eql?` | Value equality without type coercion | `1.eql?(1.0)` → `false` |
+| `equal?` | Object identity — same memory address | `"a".equal?("a")` → `false` |
+
+```ruby
+1 == 1.0        # true  — Integer and Float compare equal by value
+1.eql?(1.0)     # false — different types, no coercion
+1.equal?(1)     # true  — small integers are cached (same object)
+
+"hello" == "hello"      # true  — same content
+"hello".eql?("hello")   # true  — same content, same type
+"hello".equal?("hello") # false — two different String objects in memory
+```
+
+`equal?` is essentially `object_id ==` and should almost never be used for business logic.
+
+---
+
+### `&&` / `||` vs `and` / `or`
+
+Ruby has two sets of boolean operators. They behave identically as conditionals but have **very different operator precedence**:
+
+```ruby
+# && / || have higher precedence than assignment
+x = true && false   # x = (true && false) → x = false
+
+# and / or have lower precedence than assignment
+x = true and false  # (x = true) and false → x = true  ← surprising!
+```
+
+**Rule**: use `&&` and `||` for conditions. `and` / `or` are control-flow words used idiomatically in patterns like:
+
+```ruby
+result = find_record or raise "not found"
+do_something and return
+```
+
+GitLab's RuboCop config bans `and` / `or` in conditions via `Style/AndOr`. Always use `&&` / `||`.
+
+---
+
+### Safe navigation operator `&.`
+
+Introduced in Ruby 2.3. Calls the method only if the receiver is not `nil`; returns `nil` otherwise:
+
+```ruby
+user = nil
+user.name         # NoMethodError: undefined method `name' for nil
+user&.name        # => nil — no error
+
+user = User.new(name: "Alice")
+user&.name        # => "Alice"
+```
+
+Replaces the common Rails guard pattern:
+
+```ruby
+# old
+user && user.name
+
+# new
+user&.name
+```
+
+Chainable:
+
+```ruby
+user&.address&.city   # nil if user or address is nil
+```
+
+**When not to use it**: `&.` silently swallows `nil`. If `nil` should be impossible at that point in the code, let it raise `NoMethodError` so the bug surfaces immediately.
+
+---
+
+### Symbols vs Strings
+
+| Property | Symbol | String |
+| --- | --- | --- |
+| Mutability | Immutable | Mutable (unless frozen) |
+| Memory | One object per name — `:foo` is always the same object | Each `"foo"` literal is a new object |
+| Use case | Hash keys, method names, identifiers | User-facing text, data |
+
+```ruby
+:name.object_id == :name.object_id    # => true  — same object always
+"name".object_id == "name".object_id  # => false — two distinct objects
+
+:hello.to_s     # => "hello"
+"hello".to_sym  # => :hello
+```
+
+Rails hashes often accept both — `ActionController::Parameters` is a `HashWithIndifferentAccess`:
+
+```ruby
+params[:name]   # works
+params["name"]  # also works
+```
+
+---
+
+### `||=` — conditional assignment and memoization
+
+Assigns only if the variable is `nil` or `false`:
+
+```ruby
+x = nil
+x ||= "default"      # x = "default"
+
+x = "already set"
+x ||= "default"      # x = "already set" — not reassigned
+
+x = false
+x ||= "default"      # x = "default" — false is also falsy!
+```
+
+Common Rails memoization pattern:
+
+```ruby
+def current_user
+  @current_user ||= User.find_by(id: session[:user_id])
+end
+```
+
+The DB is only hit on the first call. **Gotcha**: if `find_by` returns `nil`, `@current_user` stays `nil` and the DB is hit again every call. Use `defined?` to cache `nil` explicitly:
+
+```ruby
+def current_user
+  return @current_user if defined?(@current_user)
+  @current_user = User.find_by(id: session[:user_id])
+end
+```
+
+---
+
+### `Integer()` vs `.to_i` — strict vs lenient conversion
+
+```ruby
+"42".to_i        # => 42
+"abc".to_i       # => 0    ← silent fallback
+"42abc".to_i     # => 42   ← stops at first non-digit
+
+Integer("42")    # => 42
+Integer("abc")   # ArgumentError: invalid value for Integer(): "abc"
+Integer("42abc") # ArgumentError — strict, no partial parse
+```
+
+Use `Integer()` when bad input should raise (e.g., validating a user-supplied ID). Use `.to_i` only when a `0` fallback is acceptable. The same pattern applies to `Float()` vs `.to_f`.
+
+---
+
+### `respond_to?` and duck typing
+
+Ruby uses duck typing — you call methods on objects without checking their class. `respond_to?` checks capability before invoking:
+
+```ruby
+def serialize(obj)
+  if obj.respond_to?(:to_json)
+    obj.to_json
+  else
+    obj.to_s
+  end
+end
+```
+
+Preferred over `is_a?` because it works with any object that has the right interface regardless of inheritance. A `File`, a `StringIO`, and a custom class can all respond to `#read` — `respond_to?(:read)` accepts all three; `is_a?(IO)` rejects the custom class.
+
+---
+
+### `method_missing` and `respond_to_missing?`
+
+When you call a method that doesn't exist, Ruby calls `method_missing` before raising `NoMethodError`. This is how Rails dynamic finders and `OpenStruct` work:
+
+```ruby
+class FlexibleConfig
+  def initialize(data)
+    @data = data
+  end
+
+  def method_missing(name, *args)
+    key = name.to_s
+    @data.key?(key) ? @data[key] : super
+  end
+
+  def respond_to_missing?(name, include_private = false)
+    @data.key?(name.to_s) || super
+  end
+end
+
+config = FlexibleConfig.new("timeout" => 30)
+config.timeout               # => 30
+config.respond_to?(:timeout) # => true — because of respond_to_missing?
+```
+
+**Always define `respond_to_missing?` alongside `method_missing`** — otherwise `respond_to?` returns `false` for methods you handle, breaking contracts other code relies on.
+
+---
+
+### `Comparable` and `<=>` (spaceship operator)
+
+`<=>` returns `-1`, `0`, or `1` (or `nil` if not comparable):
+
+```ruby
+1 <=> 2     # => -1
+2 <=> 2     # => 0
+3 <=> 2     # => 1
+"a" <=> "b" # => -1
+```
+
+`Array#sort` uses `<=>` internally. Include `Comparable` in a class and define `<=>` to get `<`, `>`, `<=`, `>=`, `between?`, and `clamp` for free:
+
+```ruby
+class Priority
+  include Comparable
+  attr_reader :level
+  def initialize(level) = @level = level
+  def <=>(other) = level <=> other.level
+end
+
+low  = Priority.new(1)
+high = Priority.new(3)
+low < high    # => true
+high > low    # => true
+[high, low].sort  # => [low, high]
+```
+
+---
+
+### Ruby Particularities — Interview Q&A
+
+**Q: Is `0` truthy in Ruby?**
+Yes. Only `nil` and `false` are falsy. Every other object — including `0`, `""`, `[]`, `{}` — is truthy. This is a deliberate design choice and differs from JavaScript, Python, and C.
+
+**Q: What's the difference between `blank?` and `nil?`?**
+`nil?` returns `true` only for `nil`. `blank?` (Rails/ActiveSupport) returns `true` for `nil`, `false`, empty strings, whitespace-only strings, and empty collections. Use `nil?` when you specifically want to detect `nil`; use `blank?` in Rails controllers and models where the value might be any of those "nothing useful" cases.
+
+**Q: What does `||=` do and what's its gotcha?**
+`x ||= value` assigns `value` to `x` only if `x` is currently `nil` or `false`. First gotcha: `false` is also replaced, which can be surprising. Second gotcha: if the right-hand side has a side effect (like a DB query that returns `nil`), that side effect fires every call when the cached value is `nil`. Solve the second with `return @var if defined?(@var)`.
+
+**Q: What's the difference between `==`, `eql?`, and `equal?`?**
+`==` is value equality and can be overridden — `1 == 1.0` is `true`. `eql?` is value equality without type coercion — `1.eql?(1.0)` is `false`. `equal?` is object identity (same `object_id`) — almost never useful for business logic.
+
+**Q: When would you use `respond_to?` over `is_a?`?**
+`is_a?` checks the class hierarchy. `respond_to?` checks capability — whether the object can handle a message. Duck typing prefers capability: `respond_to?(:read)` accepts any readable object regardless of class, while `is_a?(IO)` rejects anything not in the IO hierarchy.
+
+**Q: What happens if you define `method_missing` but not `respond_to_missing?`?**
+`respond_to?(:that_method)` returns `false` even though you handle it. Code that checks `respond_to?` before calling (a common defensive pattern) will skip your handler. Always pair them.
