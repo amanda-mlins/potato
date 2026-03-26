@@ -3226,3 +3226,221 @@ Yes. Only `nil` and `false` are falsy. Every other object — including `0`, `""
 
 **Q: What happens if you define `method_missing` but not `respond_to_missing?`?**
 `respond_to?(:that_method)` returns `false` even though you handle it. Code that checks `respond_to?` before calling (a common defensive pattern) will skip your handler. Always pair them.
+
+---
+
+## 23. Multi-Format Responses — `respond_to` and the JSON API Pattern
+
+Rails controllers can serve HTML and JSON (or any other format) from the same action using `respond_to`. This is the foundation of building an app that works as both a traditional web UI and an API.
+
+---
+
+### How Rails decides which format to serve
+
+Rails inspects two things in the incoming request, in priority order:
+
+1. **The `Accept` header** — sent by the client: `Accept: application/json`
+2. **The format suffix in the URL** — `/issues/1.json` vs `/issues/1`
+
+If neither is specified, Rails defaults to HTML. If the client requests a format the action doesn't handle, Rails raises `ActionController::UnknownFormat` (406 Not Acceptable).
+
+---
+
+### `respond_to` — the core API
+
+```ruby
+def show
+  respond_to do |format|
+    format.html           # no block = render the default template (show.html.erb)
+    format.json { render json: @issue }
+  end
+end
+```
+
+The block passed to `format.json` is only executed when the request asks for JSON. The block passed to `format.html` is optional — omitting it tells Rails to render the matching view template as usual.
+
+---
+
+### Full CRUD pattern with HTML + JSON
+
+```ruby
+class IssuesController < ApplicationController
+  before_action :set_issue, only: %i[show edit update destroy]
+
+  # GET /issues/1
+  # GET /issues/1.json
+  def show
+    respond_to do |format|
+      format.html           # → app/views/issues/show.html.erb
+      format.json { render json: @issue }
+    end
+  end
+
+  # POST /issues
+  # POST /issues.json
+  def create
+    @issue = @project.issues.new(issue_params)
+
+    respond_to do |format|
+      if @issue.save
+        format.html { redirect_to @issue, notice: "Issue was successfully created." }
+        format.json { render json: @issue, status: :created, location: @issue }
+      else
+        format.html { render :new, status: :unprocessable_content }
+        format.json { render json: @issue.errors, status: :unprocessable_content }
+      end
+    end
+  end
+
+  # PATCH /issues/1
+  # PATCH /issues/1.json
+  def update
+    respond_to do |format|
+      if @issue.update(issue_params)
+        format.html { redirect_to @issue, notice: "Issue was successfully updated." }
+        format.json { render json: @issue }
+      else
+        format.html { render :edit, status: :unprocessable_content }
+        format.json { render json: @issue.errors, status: :unprocessable_content }
+      end
+    end
+  end
+
+  # DELETE /issues/1
+  # DELETE /issues/1.json
+  def destroy
+    @issue.destroy!
+
+    respond_to do |format|
+      format.html { redirect_to issues_path, notice: "Issue was successfully deleted." }
+      format.json { head :no_content }  # 204 — success with no body
+    end
+  end
+end
+```
+
+---
+
+### What each JSON response looks like
+
+| Action | Success status | Success body | Failure status | Failure body |
+| --- | --- | --- | --- | --- |
+| `show` | 200 OK | `{ id: 1, title: "...", ... }` | — | — |
+| `create` | 201 Created | the new record as JSON | 422 | `{ title: ["can't be blank"] }` |
+| `update` | 200 OK | the updated record as JSON | 422 | `{ title: ["is too long"] }` |
+| `destroy` | 204 No Content | (empty body) | — | — |
+
+**Why `head :no_content` for destroy?** The resource no longer exists — there is nothing to render. HTTP 204 tells the client the operation succeeded but there is no body. Sending `render json: {}` would also work but is non-standard.
+
+**Why `location: @issue` on create?** The `Location` HTTP header tells the client where the newly created resource lives (`/issues/1`). This is required by the HTTP spec for 201 responses.
+
+---
+
+### `render json:` internals
+
+`render json: @issue` calls `@issue.to_json` under the hood. By default ActiveRecord serialises all columns. You can control the output:
+
+```ruby
+# exclude sensitive columns
+render json: @issue.to_json(except: [:created_at, :updated_at])
+
+# include associations
+render json: @issue.to_json(include: :labels)
+
+# custom shape with as_json
+render json: @issue.as_json(only: [:id, :title, :status])
+
+# or use a serializer gem (Jbuilder, ActiveModelSerializers, JSONAPI::Serializer)
+```
+
+GitLab uses Grape + custom entity classes for its REST API, but in plain Rails the Jbuilder view pattern (`.json.jbuilder` templates) or a serializer gem is the idiomatic choice for complex shapes.
+
+---
+
+### Enabling JSON in routes
+
+Routes don't need to change — Rails handles format negotiation automatically. But you can make format suffixes explicit with:
+
+```ruby
+# config/routes.rb
+resources :issues, defaults: { format: :json }  # always JSON unless told otherwise
+# or
+resources :issues, constraints: { format: /json|html/ }
+```
+
+Most apps leave routes as-is and rely on the `Accept` header.
+
+---
+
+### Testing multi-format actions in request specs
+
+```ruby
+# spec/requests/issues_spec.rb
+
+describe "GET /issues/:id" do
+  let(:issue) { create(:issue) }
+
+  context "HTML request" do
+    it "returns 200" do
+      get issue_path(issue)
+      expect(response).to have_http_status(:ok)
+    end
+  end
+
+  context "JSON request" do
+    it "returns the issue as JSON" do
+      get issue_path(issue), headers: { "Accept" => "application/json" }
+
+      expect(response).to have_http_status(:ok)
+      expect(response.content_type).to include("application/json")
+
+      json = JSON.parse(response.body)
+      expect(json["id"]).to eq(issue.id)
+      expect(json["title"]).to eq(issue.title)
+    end
+  end
+end
+
+describe "POST /issues (JSON)" do
+  let(:project) { create(:project) }
+
+  context "with valid params" do
+    it "creates the issue and returns 201" do
+      post project_issues_path(project),
+           params: { issue: { title: "New issue", author_name: "Alice" } },
+           headers: { "Accept" => "application/json" }
+
+      expect(response).to have_http_status(:created)
+      expect(response.headers["Location"]).to be_present
+    end
+  end
+
+  context "with invalid params" do
+    it "returns 422 and the errors hash" do
+      post project_issues_path(project),
+           params: { issue: { title: "" } },
+           headers: { "Accept" => "application/json" }
+
+      expect(response).to have_http_status(:unprocessable_content)
+      json = JSON.parse(response.body)
+      expect(json["title"]).to include("can't be blank")
+    end
+  end
+end
+```
+
+---
+
+### Multi-Format Responses — Interview Q&A
+
+**Q: How does Rails decide which format to render?**
+It checks the `Accept` request header first, then the URL suffix (`.json`, `.html`). If neither is present, it defaults to HTML. If the client requests a format the action doesn't handle, Rails responds with 406 Not Acceptable.
+
+**Q: What happens if you call `respond_to` but omit a `format.json` block and the client sends `Accept: application/json`?**
+Rails raises `ActionController::UnknownFormat`, which results in a 406 response. Always declare every format you want to support.
+
+**Q: Why use `head :no_content` instead of `render json: {}` on destroy?**
+HTTP semantics: 204 No Content means the operation succeeded and there is no body to parse. It is the correct status for a successful DELETE. Returning `{}` with 200 is technically wrong because the body implies there is content.
+
+**Q: How do you customise what gets serialised to JSON?**
+`render json:` calls `to_json` on the object. You can pass `only:`, `except:`, and `include:` options to `as_json` / `to_json`, or use a dedicated serialiser — Jbuilder (view templates), ActiveModelSerializers, or JSONAPI::Serializer — for more complex shapes.
