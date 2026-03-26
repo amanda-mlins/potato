@@ -35,6 +35,7 @@
 25. [Where Logic Lives — Model, Controller, Service Object & Beyond](#25-where-logic-lives--model-controller-service-object--beyond)
 26. [Background Jobs — ActiveJob & Solid Queue](#26-background-jobs--activejob--solid-queue)
 27. [Capybara & System Tests — Drivers, DSL, and Best Practices](#27-capybara--system-tests--drivers-dsl-and-best-practices)
+28. [The Testing Pyramid — Types of Tests in Rails & How GitLab Does It](#28-the-testing-pyramid--types-of-tests-in-rails--how-gitlab-does-it)
 
 ---
 
@@ -5001,3 +5002,369 @@ Cuprite drives Chrome directly via the Chrome DevTools Protocol, eliminating the
 
 **Q: How do you debug a failing system test?**
 `save_screenshot` / `save_and_open_screenshot` captures the page at the point of failure. `save_and_open_page` dumps the HTML. Running the test with a non-headless driver (`:selenium, using: :chrome`) lets you watch the browser interact with the page. On CI, configure an `after(:each)` hook that saves a screenshot whenever `example.exception` is non-nil, so failures are always captured even in headless mode.
+
+---
+
+## 28. The Testing Pyramid — Types of Tests in Rails & How GitLab Does It
+
+The testing pyramid is a framework for deciding *how many* of each type of test to write and *when* to reach for each one. Understanding it is one of the most common senior-level interview topics — both because it affects team velocity and because it reveals whether a developer thinks about feedback speed, confidence, and maintainability together.
+
+---
+
+### The pyramid
+
+```text
+          /‾‾‾‾‾‾‾‾‾‾‾‾‾\
+         /   E2E / System  \     ← fewest; slow; high confidence
+        /‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾\
+       /  Integration / Request \  ← moderate number; medium speed
+      /‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾\
+     /        Unit Tests          \  ← most; fast; isolated
+    /‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾\
+```
+
+**Invert the pyramid and you get the "ice cream cone" anti-pattern**: mostly slow E2E tests, few units, no integration. Suites that take 40 minutes to run, break on unrelated DOM changes, and give no guidance about *which layer* contains the bug.
+
+The pyramid principle:
+
+- **Write many small, fast, isolated unit tests** — they are cheap to write, cheap to run, and pinpoint failures exactly
+- **Write a moderate layer of integration tests** — they verify that components fit together correctly
+- **Write few end-to-end tests** — only for the critical happy paths that need confidence from top to bottom
+
+---
+
+### The four levels in Rails
+
+| Level | Rails type | Gem | What it touches | Speed |
+| --- | --- | --- | --- | --- |
+| Unit | Model spec, service spec, validator spec, presenter spec | RSpec | A single class in isolation | ⚡ <10 ms each |
+| Integration | Request spec | RSpec + `rack_test` | Full Rack stack: routes, controller, DB, serialiser | 🏃 ~100 ms each |
+| Component | Controller spec | RSpec | Controller in isolation (deprecated by request specs) | 🏃 ~50 ms each |
+| End-to-end | System spec / feature spec | RSpec + Capybara + Selenium/Cuprite | Full browser, JS, real HTTP server | 🐢 1–10 s each |
+
+---
+
+### Level 1 — Unit tests
+
+Unit tests exercise **one class in isolation**. Dependencies are either stubbed or replaced with fakes. In Rails this means:
+
+- **Model specs** — validations, associations, scopes, instance methods
+- **Service object specs** — business logic, return values; collaborators stubbed
+- **Validator specs** — the custom validator class alone
+- **Presenter / decorator specs** — formatting methods
+- **Job specs** — the `perform` method with `perform_now`
+- **Mailer specs** — template rendering, recipients, subject
+
+```ruby
+# spec/models/issue_spec.rb — unit test
+RSpec.describe Issue, type: :model do
+  describe "validations" do
+    it { is_expected.to validate_presence_of(:title) }
+    it { is_expected.to validate_length_of(:title).is_at_most(255) }
+  end
+
+  describe "#closed?" do
+    it "returns true when status is closed" do
+      issue = build(:issue, status: :closed)
+      expect(issue.closed?).to be true
+    end
+  end
+end
+```
+
+**Rules:**
+
+- No HTTP — do not call `get`, `post`, or visit any URL
+- No integration with other services — stub mailers, jobs, external APIs
+- Use `build` (not `create`) when you don't need persistence — no DB hit
+- Fast enough that the full model spec suite runs in under 10 seconds
+
+---
+
+### Level 2 — Request specs (integration)
+
+Request specs send a real HTTP request through the full Rack stack: router → middleware → controller → model → DB → serialiser → response. They replace controller specs (which are now officially discouraged by RSpec and the Rails core team).
+
+```ruby
+# spec/requests/issues_spec.rb — integration test
+RSpec.describe "Issues API", type: :request do
+  let(:project) { create(:project) }
+  let(:issue)   { create(:issue, project: project) }
+
+  describe "GET /projects/:id/issues/:id" do
+    it "returns the issue as JSON" do
+      get project_issue_path(project, issue), as: :json
+
+      expect(response).to have_http_status(:ok)
+      expect(json[:title]).to eq(issue.title)
+    end
+
+    it "returns 404 for a missing issue" do
+      get project_issue_path(project, id: 0), as: :json
+      expect(response).to have_http_status(:not_found)
+    end
+  end
+
+  describe "POST /projects/:id/issues" do
+    it "creates an issue and returns 201" do
+      expect {
+        post project_issues_path(project),
+             params: { issue: { title: "New bug", author_name: "Alice", status: "open" } },
+             as: :json
+      }.to change(Issue, :count).by(1)
+
+      expect(response).to have_http_status(:created)
+    end
+
+    it "returns 422 when title is blank" do
+      post project_issues_path(project),
+           params: { issue: { title: "", author_name: "Alice" } },
+           as: :json
+
+      expect(response).to have_http_status(:unprocessable_entity)
+      expect(json[:title]).to include("can't be blank")
+    end
+  end
+
+  private
+
+  def json
+    response.parsed_body.with_indifferent_access
+  end
+end
+```
+
+**What request specs cover that unit tests don't:**
+
+- Routing (the correct controller action is wired to the path)
+- Parameter filtering (`strong_parameters` doing its job)
+- HTTP status codes and response headers
+- JSON rendering (Jbuilder, serialisers)
+- `before_action` callbacks and authentication filters
+- Database round-trip (the record is actually persisted)
+
+**What they don't cover:**
+
+- JavaScript behaviour
+- Real browser rendering
+- Session cookies across page navigations (use system tests for that)
+
+---
+
+### Level 3 — System specs / feature specs (E2E)
+
+System specs (RSpec `type: :system`) and feature specs (RSpec `type: :feature`) both use Capybara to drive a browser. They are effectively the same thing — `feature`/`scenario` are aliases for `describe`/`it` with `type: :feature` applied automatically.
+
+**GitLab's naming convention** uses `type: :feature` for Capybara tests; Rails' own generator creates `type: :system`. Either works — choose one and be consistent.
+
+```ruby
+# spec/system/issues_spec.rb — E2E test
+RSpec.describe "Creating an issue", type: :system do
+  let(:project) { create(:project) }
+
+  before { driven_by :selenium, using: :headless_chrome }
+
+  it "lets a user create an issue and see it in the list" do
+    visit new_project_issue_path(project)
+
+    fill_in "Title",       with: "Login button broken"
+    fill_in "Author name", with: "Alice"
+    select  "Open",        from: "Status"
+    click_on "Create Issue"
+
+    expect(page).to have_content("Issue was successfully created")
+    expect(page).to have_content("Login button broken")
+  end
+end
+```
+
+**When to write a system test instead of a request spec:**
+
+| Situation | Use |
+| --- | --- |
+| Testing JavaScript interactions (Turbo, Stimulus, modals) | System test |
+| Testing a full multi-step user flow (login → navigate → act → assert redirect) | System test |
+| Testing form validation UX (error messages appear inline) | System test |
+| Testing HTTP status codes, JSON shape, redirects | Request spec |
+| Testing a controller filter or middleware | Request spec |
+| Testing business logic that doesn't need a browser | Unit test or request spec |
+
+---
+
+### Controller specs — avoid them
+
+Controller specs (`type: :controller`) test the controller in isolation using `get`/`post` helpers that bypass the router. They were the Rails 3/4 standard but have two problems:
+
+1. They bypass routing — they don't catch misconfigured routes
+2. They are less realistic than request specs (different middleware stack)
+
+Both RSpec and the Rails core team now recommend **replacing controller specs with request specs**. New projects should not write controller specs at all.
+
+---
+
+### GitLab's testing approach
+
+GitLab is one of the most tested Rails codebases in the world. Their [testing guide](https://docs.gitlab.com/development/testing_guide/) defines exactly what spec type to use for each situation:
+
+#### GitLab's spec type rules
+
+| GitLab name | RSpec type | When GitLab uses it |
+| --- | --- | --- |
+| Unit spec | `type: :model`, `:service`, `:worker`, `:validator`, `:presenter` | Single-class logic |
+| Request spec | `type: :request` | JSON APIs, status codes, auth filters |
+| Feature spec | `type: :feature` | Full browser flows with Capybara |
+| Helper spec | `type: :helper` | View helpers |
+| Routing spec | `type: :routing` | Named route correctness |
+| GraphQL spec | `type: :request` | GraphQL queries and mutations |
+
+GitLab explicitly states:
+
+> "We have no controller specs. We use request specs for testing controllers."
+
+> "Feature specs are expensive. We use them for critical paths only."
+
+#### GitLab's test speed tiers
+
+GitLab's CI pipeline groups tests into speed tiers:
+
+| Tier | Max per-example | What it contains |
+| --- | --- | --- |
+| `~unit` | < 1 s | Model, service, worker, validator specs |
+| `~integration` | < 5 s | Request specs, mailer specs |
+| `~system` | < 30 s | Feature/system specs |
+
+Any spec that exceeds its tier's budget is flagged in code review and must be optimised.
+
+#### GitLab's shared examples pattern
+
+GitLab uses RSpec shared examples extensively to avoid duplication across similar specs:
+
+```ruby
+# spec/support/shared_examples/a_valid_issue.rb
+RSpec.shared_examples "a valid issue" do
+  it { is_expected.to be_valid }
+  it { is_expected.to validate_presence_of(:title) }
+  it { is_expected.to belong_to(:project) }
+end
+
+# In any model spec:
+RSpec.describe Issue, type: :model do
+  subject { build(:issue) }
+  it_behaves_like "a valid issue"
+end
+```
+
+#### GitLab's factory discipline
+
+GitLab's guide is explicit: **factories should build the minimum valid object**. Traits add associations on demand. Never use `create` when `build` is enough:
+
+```ruby
+# ✅ Minimum factory — no unnecessary associations
+FactoryBot.define do
+  factory :issue do
+    sequence(:title) { |n| "Issue #{n}" }
+    author_name { "Alice" }
+    status      { :open }
+    association :project
+  end
+
+  trait :closed do
+    status { :closed }
+  end
+
+  trait :with_labels do
+    after(:create) do |issue|
+      issue.labels << create(:label)
+    end
+  end
+end
+
+# In a spec that needs closed + labels:
+create(:issue, :closed, :with_labels)
+```
+
+#### GitLab's RSpec metadata tags
+
+GitLab tags examples with metadata to control which suite they run in and which setup they need:
+
+```ruby
+it "sends an email", :mailer do ... end         # loads Action Mailer helpers
+it "uses Redis cache", :use_clean_rails_redis_caching do ... end
+it "is an API test", :api do ... end
+it "runs in the background", :sidekiq_inline do ... end  # drains Sidekiq inline
+```
+
+---
+
+### The decision flowchart — which spec type?
+
+```text
+Is this testing a single class with no HTTP?
+  YES → unit spec (model / service / validator / presenter / job)
+
+Does it need HTTP but no browser / no JS?
+  YES → request spec
+
+Does it need a real browser or JS?
+  YES → system / feature spec
+
+Is it testing a named route?
+  YES → routing spec (or just test it implicitly in a request spec)
+
+Is it testing a view helper method?
+  YES → helper spec
+```
+
+**When feature specs beat request specs:**
+
+1. **JavaScript is involved** — `rack_test` cannot run JS. If the flow requires Turbo, Stimulus, a modal, or an AJAX call that updates the DOM, you need a browser.
+2. **Multi-step navigation** — a flow that spans multiple page loads (login → dashboard → click link → fill form → confirm redirect) is much cleaner as a feature spec than a chain of request specs.
+3. **Visual feedback validation** — confirming that a flash message appears in the right place, an error is shown inline next to the correct field, or a badge changes colour is only possible with a browser.
+4. **Acceptance criteria from a user story** — when the ticket says "as a user I can create an issue", a feature spec reads exactly like the acceptance criterion.
+
+**When request specs beat feature specs:**
+
+1. **JSON API behaviour** — response shape, status codes, headers. Capybara doesn't inspect HTTP status codes directly; request specs do.
+2. **Authorization / authentication logic** — testing that a 401 or 403 is returned for the right conditions is cleaner in a request spec.
+3. **Edge cases and error paths** — testing 20 different invalid input combinations in a browser is slow. One request spec per case is 100× faster.
+4. **Middleware and filters** — `before_action`, rate limiting, content negotiation live at the HTTP layer, not the browser layer.
+
+---
+
+### Testing pyramid in this project
+
+| Spec file | Type | Level |
+| --- | --- | --- |
+| `spec/models/issue_spec.rb` | `:model` | Unit |
+| `spec/models/project_spec.rb` | `:model` | Unit |
+| `spec/validators/no_profanity_validator_spec.rb` | `:model` | Unit |
+| `spec/requests/issues_spec.rb` | `:request` | Integration |
+| `spec/requests/projects_spec.rb` | `:request` | Integration |
+| `spec/system/issues_spec.rb` | `:system` | E2E |
+
+**Current split**: heavy on unit and request specs (fast, precise), light on system specs (only critical flows). This matches the pyramid and GitLab's own guidance.
+
+---
+
+### The Testing Pyramid — Interview Q&A
+
+**Q: What is the testing pyramid and why does it matter?**
+The testing pyramid says: write many unit tests (fast, isolated, cheap), a moderate layer of integration tests (verify components fit together), and few end-to-end tests (slow, expensive, but highest confidence). It matters because an inverted pyramid — lots of E2E tests, few units — creates suites that take 40+ minutes, break on unrelated UI changes, and give no guidance about where a bug lives. The pyramid maximises feedback speed while maintaining confidence.
+
+**Q: What is the difference between a request spec and a system spec in Rails?**
+A request spec (`type: :request`) uses `rack_test` to send HTTP requests directly to the Rack app — no browser, no JS. It's fast and precise for testing status codes, JSON shape, redirects, and authentication. A system spec (`type: :system`) drives a real browser via Capybara + Selenium/Cuprite — it tests JavaScript interactions, multi-page flows, and real browser rendering. System specs are 10–100× slower; use them only for critical user journeys that require a browser.
+
+**Q: Why does the Rails community recommend request specs over controller specs?**
+Controller specs (`type: :controller`) test the controller in isolation by bypassing the router. They use a different middleware stack from real requests, so they miss routing bugs and middleware behaviour. The RSpec team and the Rails core team both now recommend request specs, which go through the full Rack stack including routing, and produce more realistic results. New projects should have zero controller specs.
+
+**Q: When would you choose a feature spec over a request spec?**
+When the scenario requires JavaScript (Turbo frames, Stimulus controllers, modal dialogs, AJAX updates), spans multiple page navigations, or validates visual/UX behaviour (flash messages, inline errors, badge states). For anything that can be tested via HTTP alone — JSON shape, status codes, authentication filters, edge-case inputs — a request spec is faster, more precise, and the right choice.
+
+**Q: How does GitLab structure its test suite?**
+GitLab uses: unit specs for every service, model, validator, worker, and presenter; request specs for all API endpoints (no controller specs at all); feature specs for critical browser flows only. They enforce speed tiers (unit < 1s, integration < 5s, system < 30s per example) and flag violations in code review. They use shared examples to avoid duplication and FactoryBot traits to build minimum-valid objects.
+
+**Q: What is the "ice cream cone" anti-pattern?**
+The inverted testing pyramid. A codebase with mostly E2E/feature tests and few unit tests. Symptoms: the test suite takes 30–60 minutes, failures don't tell you which class is broken, a small CSS change breaks dozens of tests, and developers stop running the suite locally. The fix is to push coverage down the pyramid: extract business logic into service objects and unit-test those; use request specs for HTTP behaviour; reserve feature specs for the 5–10 most critical user journeys.
+
+**Q: What is the `build` vs `create` distinction in FactoryBot and why does it matter for test speed?**
+`create` persists the record to the database (INSERT). `build` instantiates the Ruby object without hitting the database. For unit tests that only need the object in memory (validations, method logic), `build` is correct — it avoids a DB round-trip and makes the test 10–50× faster. Using `create` everywhere is the most common cause of slow model spec suites.
