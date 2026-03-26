@@ -33,6 +33,8 @@
 23. [Multi-Format Responses — `respond_to` and the JSON API Pattern](#23-multi-format-responses--respond_to-and-the-json-api-pattern)
 24. [Jbuilder — JSON View Templates](#24-jbuilder--json-view-templates)
 25. [Where Logic Lives — Model, Controller, Service Object & Beyond](#25-where-logic-lives--model-controller-service-object--beyond)
+26. [Background Jobs — ActiveJob & Solid Queue](#26-background-jobs--activejob--solid-queue)
+27. [Capybara & System Tests — Drivers, DSL, and Best Practices](#27-capybara--system-tests--drivers-dsl-and-best-practices)
 
 ---
 
@@ -4256,3 +4258,746 @@ Background execution of slow or non-critical work: email delivery, external webh
 
 **Q: What does GitLab mean by "bounded contexts"?**
 A bounded context is a Ruby namespace that groups related domain classes. `Ci::`, `MergeRequests::`, `Issues::` are bounded contexts in GitLab's codebase. Code related to CI lives under `Ci::`, not scattered at the top level. This makes coupling visible — excessive cross-namespace imports signal a misplaced abstraction. GitLab enforces it with the `Gitlab/BoundedContexts` RuboCop cop.
+
+---
+
+## 26. Background Jobs — ActiveJob & Solid Queue
+
+Background jobs let a Rails app hand off slow or non-critical work — email delivery, webhook notifications, report generation, cache warm-ups — so that the HTTP response returns instantly. This section covers the full stack: the ActiveJob abstraction, Solid Queue (the Rails 8 default adapter), adapter configuration, job design, retries, idempotency, testing, and how GitLab approaches background work at scale.
+
+---
+
+### Why background jobs exist
+
+A synchronous request-response cycle has a hard budget: the browser (or API client) is waiting. Anything that takes more than a few hundred milliseconds risks a timeout or a bad UX. Background jobs solve this by:
+
+1. Returning the HTTP response immediately ("your report is being generated")
+2. Enqueuing a job record in a persistent store (database, Redis, etc.)
+3. Letting a separate worker process pick up and execute the job asynchronously
+
+Rails provides **ActiveJob** as a unified interface, and as of Rails 8.0, **Solid Queue** ships as the default backend — a database-backed queue that requires no extra infrastructure (no Redis, no separate service).
+
+---
+
+### ActiveJob — the abstraction layer
+
+ActiveJob is a wrapper around any queue backend. It defines a standard API so you can swap adapters without changing job code.
+
+**Anatomy of a job:**
+
+```ruby
+# app/jobs/issue_close_notification_job.rb
+class IssueCloseNotificationJob < ApplicationJob
+  queue_as :default
+
+  def perform(issue_id, closed_by_id)
+    issue     = Issue.find(issue_id)
+    closed_by = User.find(closed_by_id)
+    IssueMailer.closed_notification(issue, closed_by).deliver_now
+  end
+end
+```
+
+**Enqueuing from a service object (never from a controller):**
+
+```ruby
+# app/services/issues/close_service.rb
+module Issues
+  class CloseService
+    def initialize(issue:, current_user:)
+      @issue        = issue
+      @current_user = current_user
+    end
+
+    def execute
+      @issue.update!(status: :closed)
+      IssueCloseNotificationJob.perform_later(@issue.id, @current_user.id)
+      ServiceResponse.success(payload: { issue: @issue })
+    end
+  end
+end
+```
+
+**Why pass IDs, not objects?**
+
+Jobs are serialised to JSON and stored in the queue. Active Record objects can't be serialised reliably — you'd get a stale object if the job runs after a deploy. Pass the ID and reload inside `perform`. ActiveJob's `GlobalID` support does this automatically for AR objects, but plain IDs are more explicit and interviewers often ask about this.
+
+---
+
+### Solid Queue — Rails 8's default adapter
+
+Solid Queue was introduced alongside Rails 8. It stores jobs in your existing database (PostgreSQL, SQLite, MySQL) using three tables: `solid_queue_jobs`, `solid_queue_ready_executions`, and `solid_queue_claimed_executions`. No Redis required.
+
+**How it works:**
+
+| Concept | Solid Queue equivalent |
+| --- | --- |
+| Job record | Row in `solid_queue_jobs` |
+| Ready to run | Row in `solid_queue_ready_executions` |
+| Running now | Row in `solid_queue_claimed_executions` (advisory lock) |
+| Failed | Row in `solid_queue_failed_executions` |
+| Scheduled (future) | Row in `solid_queue_scheduled_executions` |
+
+Workers poll the database, claim a job with a database lock (no race conditions), and delete the execution record on success. On failure the record moves to `solid_queue_failed_executions` for inspection and retry.
+
+**Starting the worker in development:**
+
+```bash
+bin/jobs          # the Solid Queue worker process — already present in Rails 8 apps
+# or
+bundle exec rake solid_queue:start
+```
+
+**In production (`Procfile` / `kamal`):**
+
+```text
+web:    bundle exec puma -C config/puma.rb
+worker: bundle exec rake solid_queue:start
+```
+
+---
+
+### Adapter configuration
+
+Rails 8 apps configure the queue adapter per-environment.
+
+**`config/application.rb`** — set the default:
+
+```ruby
+config.active_job.queue_adapter = :solid_queue
+```
+
+**`config/queue.yml`** — Solid Queue worker configuration (queues, concurrency, polling interval):
+
+```yaml
+default: &default
+  dispatchers:
+    - polling_interval: 1
+      batch_size: 500
+  workers:
+    - queues: "*"
+      threads: 3
+      polling_interval: 0.1
+
+development:
+  <<: *default
+
+production:
+  <<: *default
+  workers:
+    - queues: "default,mailers"
+      threads: 5
+      polling_interval: 0.5
+    - queues: "low"
+      threads: 2
+      polling_interval: 2
+```
+
+**For tests — use the inline adapter** (runs jobs synchronously, no worker needed):
+
+```ruby
+# config/environments/test.rb
+config.active_job.queue_adapter = :test
+```
+
+---
+
+### Queue priorities
+
+Jobs are assigned to named queues. Workers can be configured to only process certain queues, enabling priority lanes:
+
+```ruby
+class IssueCloseNotificationJob < ApplicationJob
+  queue_as :mailers       # high-priority — user-facing email
+end
+
+class WeeklyReportJob < ApplicationJob
+  queue_as :low           # low-priority — can wait
+end
+
+class DataExportJob < ApplicationJob
+  queue_as :default
+end
+```
+
+Name your queues to reflect business priority, not technical implementation. `mailers`, `default`, `low` is a common three-tier pattern.
+
+---
+
+### Retries and error handling
+
+ActiveJob provides built-in retry DSL:
+
+```ruby
+class IssueCloseNotificationJob < ApplicationJob
+  queue_as :mailers
+
+  # Retry up to 5 times with exponential back-off; discard if the issue was deleted
+  retry_on StandardError, wait: :polynomially_longer, attempts: 5
+  discard_on ActiveRecord::RecordNotFound
+
+  def perform(issue_id, closed_by_id)
+    issue     = Issue.find(issue_id)     # raises RecordNotFound → discarded
+    closed_by = User.find(closed_by_id)
+    IssueMailer.closed_notification(issue, closed_by).deliver_now
+  end
+end
+```
+
+**`retry_on` options:**
+
+| Option | Meaning |
+| --- | --- |
+| `wait: :exponentially_longer` | 2s, 4s, 8s, 16s… |
+| `wait: :polynomially_longer` | 1s, 4s, 9s, 16s… (gentler) |
+| `wait: 30.seconds` | Fixed interval |
+| `attempts: N` | Max total attempts (including the first) |
+| `jitter: 0.15` | Add randomness to avoid thundering herd |
+
+**`discard_on`** — silently drop the job on these exceptions instead of retrying. Use for "this record no longer exists and there's nothing to do."
+
+---
+
+### Idempotency — the key design constraint
+
+A job can be retried after a partial execution (network timeout mid-send, process crash after the DB write but before the email). This means **`perform` must be safe to run more than once with the same arguments**.
+
+Strategies:
+
+```ruby
+# ✅ Guard with a database flag — only send if not already sent
+def perform(issue_id, closed_by_id)
+  issue = Issue.find(issue_id)
+  return if issue.close_notification_sent?     # idempotency guard
+
+  IssueMailer.closed_notification(issue, User.find(closed_by_id)).deliver_now
+  issue.update_columns(close_notification_sent: true)
+end
+
+# ✅ Use find_or_create_by / upsert for write operations
+def perform(project_id)
+  AuditEvent.find_or_create_by!(
+    target_type: "Project",
+    target_id:   project_id,
+    action:      "weekly_digest_sent",
+    occurred_at: Date.current
+  )
+end
+
+# ❌ Not idempotent — sends duplicate emails on retry
+def perform(issue_id, closed_by_id)
+  issue = Issue.find(issue_id)
+  IssueMailer.closed_notification(issue, User.find(closed_by_id)).deliver_now
+end
+```
+
+---
+
+### Scheduling recurring jobs
+
+Rails 8 / Solid Queue supports cron-style recurring jobs via `config/recurring.yml`:
+
+```yaml
+# config/recurring.yml
+production:
+  weekly_digest:
+    class: WeeklyDigestJob
+    schedule: "0 9 * * 1"       # every Monday 09:00 UTC
+    queue: low
+
+  stale_issue_cleanup:
+    class: StaleIssueCleanupJob
+    schedule: "0 2 * * *"       # daily at 02:00 UTC
+    queue: default
+    args: [30]                   # days_threshold
+```
+
+No cron daemon or Whenever gem required — Solid Queue's dispatcher handles scheduling from within the process.
+
+---
+
+### Job design rules — applied from GitLab's guide
+
+GitLab's worker guidelines (from `docs.gitlab.com/development/sidekiq/`) translate directly to ActiveJob:
+
+| Rule | Reason |
+| --- | --- |
+| Pass IDs, not objects | Objects serialise stale state; IDs always reload current data |
+| Workers must be idempotent | Safe retries after partial failures |
+| Workers must be backwards-compatible | Queue may contain jobs from previous release during a rolling deploy |
+| Never change `perform` signature without a migration strategy | Old enqueued jobs have old argument shapes |
+| Limit job duration | Long-running jobs hold a worker thread; break large batches into smaller jobs |
+| Avoid DB transactions spanning the job boundary | The job itself is the unit of work |
+
+**Backwards-compatibility example:**
+
+```ruby
+# Release 1: original signature
+def perform(issue_id)
+  # ...
+end
+
+# Release 2: need to add closed_by_id — use a default so old jobs still work
+def perform(issue_id, closed_by_id = nil)
+  # ...
+end
+
+# Release 3: closed_by_id is now always present — safe to remove the default
+def perform(issue_id, closed_by_id)
+  # ...
+end
+```
+
+---
+
+### Testing background jobs
+
+**With the `:test` adapter (recommended for most tests):**
+
+```ruby
+# spec/jobs/issue_close_notification_job_spec.rb
+RSpec.describe IssueCloseNotificationJob, type: :job do
+  let(:project) { create(:project) }
+  let(:issue)   { create(:issue, project: project, status: :closed) }
+  let(:user)    { create(:user) }
+
+  describe "#perform" do
+    it "delivers a closed notification email" do
+      expect {
+        described_class.perform_now(issue.id, user.id)
+      }.to change(ActionMailer::Base.deliveries, :count).by(1)
+    end
+
+    it "discards the job if the issue no longer exists" do
+      expect {
+        described_class.perform_now(0, user.id)   # ID 0 → RecordNotFound
+      }.not_to raise_error
+    end
+  end
+end
+```
+
+**Assert a job was enqueued (without running it):**
+
+```ruby
+# In a service spec
+RSpec.describe Issues::CloseService do
+  it "enqueues a notification job" do
+    issue   = create(:issue, status: :open)
+    user    = create(:user)
+
+    expect {
+      Issues::CloseService.new(issue: issue, current_user: user).execute
+    }.to have_enqueued_mail(IssueMailer, :closed_notification)
+    # or for a plain job:
+    # .to have_enqueued_job(IssueCloseNotificationJob).with(issue.id, user.id)
+  end
+end
+```
+
+**`perform_enqueued_jobs` — run enqueued jobs inline in a test:**
+
+```ruby
+perform_enqueued_jobs do
+  Issues::CloseService.new(issue: issue, current_user: user).execute
+end
+# Now assert side effects (emails, DB changes)
+```
+
+---
+
+### Background jobs in this project
+
+This project uses SQLite in development (Rails 8 default), so Solid Queue works out of the box. Here is how the background job stack maps onto the codebase:
+
+| Concern | File |
+| --- | --- |
+| Queue adapter | `config/application.rb` — `:solid_queue` |
+| Worker config | `config/queue.yml` |
+| Recurring job schedule | `config/recurring.yml` |
+| Start the worker | `bin/jobs` |
+| Job base class | `app/jobs/application_job.rb` |
+| (future) Close notification | `app/jobs/issue_close_notification_job.rb` |
+| (future) Stale cleanup | `app/jobs/stale_issue_cleanup_job.rb` |
+
+---
+
+### Background Jobs — Interview Q&A
+
+**Q: Why pass IDs to `perform` instead of ActiveRecord objects?**
+Jobs are serialised to JSON when enqueued and may run minutes or hours later. An AR object serialised at enqueue time contains stale data by execution time. Passing the ID forces a fresh `find` inside `perform`, guaranteeing the job operates on the current state. ActiveJob's GlobalID support does this transparently for AR objects, but plain IDs make the intent explicit — and interviewers frequently ask about it.
+
+**Q: What is Solid Queue and why does Rails 8 use it by default?**
+Solid Queue is a database-backed queue adapter built by the Rails team for Rails 8. It stores jobs as rows in your existing database, so you need no additional infrastructure (no Redis, no separate process to manage). Workers claim jobs using database advisory locks, preventing duplicate processing. It supports priorities, scheduled jobs (cron-style), recurring tasks, and failed job inspection — all without leaving the database.
+
+**Q: What is the difference between `perform_later` and `perform_now`?**
+`perform_later` serialises the job and puts it in the queue — it returns immediately. A worker process picks it up and runs it asynchronously. `perform_now` runs the job synchronously in the current process, bypassing the queue. Use `perform_now` in tests and rare urgent cases; use `perform_later` everywhere else.
+
+**Q: What does idempotency mean for a job and how do you achieve it?**
+An idempotent job produces the same outcome regardless of how many times it is run with the same arguments. This matters because jobs can be retried after a partial failure (crash mid-execution, network timeout). Techniques: check a "done" flag in the database before doing work; use `upsert`/`find_or_create_by` instead of plain `create`; make email delivery conditional on a `sent_at` column being nil.
+
+**Q: What is `retry_on` and when would you use `discard_on`?**
+`retry_on ExceptionClass, wait: :polynomially_longer, attempts: 5` tells ActiveJob to re-enqueue the job with increasing delays when that exception is raised, up to `attempts` times. Use it for transient failures: network errors, rate limits, temporary service outages. `discard_on` silently drops the job when a specific exception occurs. Use it for "the record no longer exists and there is nothing to do" — typically `ActiveRecord::RecordNotFound`.
+
+**Q: How do you test that a job is enqueued without actually running it?**
+Use ActiveJob's test helpers with the `:test` adapter. `have_enqueued_job(MyJob).with(args)` asserts the job was placed in the queue. `perform_enqueued_jobs { ... }` runs all enqueued jobs inline within the block, allowing you to assert side effects. `perform_now` runs the job directly in the test process for unit-testing the job's `perform` method in isolation.
+
+**Q: What is backwards compatibility for workers and why does it matter?**
+During a rolling deploy or zero-downtime restart, the queue can contain jobs enqueued by the previous version of the code. If the new code changes the `perform` method signature (adds a required argument, removes one, reorders them), those old jobs will crash when the new worker tries to run them. The solution is a two-release migration: in release N add the new argument with a default value so old and new jobs both work; in release N+1 make the argument required.
+
+**Q: How does Solid Queue handle recurring / scheduled jobs?**
+Solid Queue's dispatcher process reads `config/recurring.yml` and enqueues jobs on the specified cron schedule. No external cron daemon or Whenever gem is needed. The dispatcher runs as part of the same worker process started by `bin/jobs`. Scheduled (future) jobs are stored in `solid_queue_scheduled_executions` and moved to the ready queue when their scheduled time arrives.
+
+---
+
+## 27. Capybara & System Tests — Drivers, DSL, and Best Practices
+
+System tests are end-to-end tests that drive a real browser (or a headless one) through your application. They catch bugs that unit and integration tests miss: JavaScript interactions, full request-response cycles, cookie/session handling, real SQL queries, real middleware. **Capybara** is the Ruby library that makes this possible. This section covers what Capybara is, how drivers work, the full DSL, configuration in Rails, and how to write reliable system tests.
+
+---
+
+### What Capybara is — and what it is not
+
+Capybara is a **browser automation DSL** for Ruby. It provides a high-level API (`visit`, `click_on`, `fill_in`, `expect(page).to have_content`) and sits on top of a swappable **driver** that does the actual browser control. Capybara itself has no idea what browser is being used — that's the driver's job.
+
+```text
+Test code (RSpec / Minitest)
+        ↓
+    Capybara DSL
+        ↓
+    Driver layer          ← rack_test, Selenium, Cuprite, Playwright
+        ↓
+  Browser / HTTP stack    ← real Chromium, Firefox, or in-process Rack app
+```
+
+This separation means you can run the same test suite with the fast in-process driver during development and the full real-browser driver in CI.
+
+---
+
+### The driver landscape
+
+| Driver | Library | Browser | JS support | Speed | Use case |
+| --- | --- | --- | --- | --- | --- |
+| `rack_test` | Built into Capybara | None — pure HTTP | ❌ No | ⚡ Fastest | Non-JS controller/integration tests |
+| `selenium_chrome` | `selenium-webdriver` gem | Chrome / Chromium | ✅ Yes | 🐢 Slowest | Full real browser; most compatible |
+| `selenium_chrome_headless` | `selenium-webdriver` gem | Headless Chrome | ✅ Yes | 🐢 Slow | CI without a display |
+| `cuprite` | `cuprite` gem | Headless Chrome (CDP) | ✅ Yes | 🚀 Fast | Preferred modern headless driver |
+| `playwright` | `playwright-ruby-client` | Chrome/Firefox/WebKit | ✅ Yes | 🚀 Fast | Multi-browser; newer alternative |
+
+**`rack_test`** is the Rails default for request specs. It speaks HTTP directly to the Rack app — no browser, no JS, no CSS rendering. Fast, but it cannot test JavaScript-driven behaviour.
+
+**Selenium** drives a real browser via the WebDriver protocol. Reliable, widely supported, but slow to start and flaky on timing if not tuned.
+
+**Cuprite** drives Chrome via the Chrome DevTools Protocol (CDP) directly — no ChromeDriver intermediary. This makes it significantly faster than Selenium while still running real JavaScript.
+
+---
+
+### Rails system tests — setup
+
+Rails 8 ships with system tests built on Capybara + Selenium out of the box.
+
+**`test/application_system_test_case.rb`** (Minitest):
+
+```ruby
+require "test_helper"
+
+class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
+  driven_by :selenium, using: :headless_chrome, screen_size: [1400, 1400]
+end
+```
+
+**RSpec equivalent** — `spec/support/capybara.rb`:
+
+```ruby
+require "capybara/rspec"
+
+RSpec.configure do |config|
+  config.before(:each, type: :system) do
+    driven_by :selenium, using: :headless_chrome, screen_size: [1400, 900]
+  end
+end
+```
+
+**Switching to Cuprite** (faster, recommended):
+
+```ruby
+# Gemfile
+gem "cuprite", group: :test
+
+# spec/support/capybara.rb
+require "capybara/cuprite"
+
+Capybara.register_driver(:cuprite) do |app|
+  Capybara::Cuprite::Driver.new(app, window_size: [1400, 900], headless: true)
+end
+
+RSpec.configure do |config|
+  config.before(:each, type: :system) do
+    driven_by :cuprite
+  end
+end
+```
+
+---
+
+### The Capybara DSL
+
+#### Navigation
+
+```ruby
+visit root_path                              # GET a URL
+visit project_issues_path(@project)
+```
+
+#### Finders — locating elements
+
+```ruby
+find("h1")                                   # CSS selector
+find("#issue-title")                         # ID
+find(".badge", text: "open")                 # selector + text filter
+find(:xpath, "//table//tr[2]")              # XPath (avoid if possible)
+find(:label, "Title")                        # accessible label
+all(".issue-row")                            # returns all matching elements
+first(".issue-row")                          # first match
+```
+
+#### Actions — interacting with the page
+
+```ruby
+click_on "New Issue"                         # matches <a> or <button> by text
+click_button "Submit"                        # buttons only
+click_link "Back"                            # links only
+
+fill_in "Title", with: "Bug in login form"   # input/textarea by label text
+fill_in "issue[title]", with: "Bug"         # by name attribute
+select "In Progress", from: "Status"         # <select> by label
+check "Send notifications"                   # checkbox
+uncheck "Send notifications"
+choose "Open"                                # radio button
+attach_file "Attachment", "/path/to/file"    # file input
+
+within("#issue-form") { click_on "Save" }    # scope actions to a container
+```
+
+#### Assertions — what to expect
+
+```ruby
+expect(page).to have_content("Issue created")
+expect(page).to have_text("Bug in login form")
+expect(page).to have_selector("h1", text: "Projects")
+expect(page).to have_link("Edit", href: edit_issue_path(@issue))
+expect(page).to have_button("Submit")
+expect(page).to have_field("Title", with: "Bug")
+expect(page).to have_select("Status", selected: "Open")
+expect(page).to have_current_path(project_path(@project))
+
+expect(page).not_to have_content("Deleted issue")
+expect(page).to have_no_selector(".error-message")
+```
+
+#### Waiting — Capybara's killer feature
+
+Capybara **automatically waits** for elements to appear. By default it retries assertions for up to 2 seconds. This handles AJAX responses, animations, and JS-rendered content without explicit `sleep` calls.
+
+```ruby
+# Capybara waits up to `Capybara.default_max_wait_time` (default: 2s)
+expect(page).to have_content("Saved!")       # retries until found or timeout
+
+# Override per-assertion
+expect(page).to have_content("Report ready", wait: 10)
+
+# Configure globally
+Capybara.default_max_wait_time = 5
+```
+
+**Never use `sleep` in system tests.** It makes tests slow and fragile. If you feel the urge to add `sleep 1`, use `have_content` or `have_selector` with an appropriate `wait:` instead.
+
+---
+
+### Writing a system test for this project
+
+```ruby
+# spec/system/issues_spec.rb
+require "rails_helper"
+
+RSpec.describe "Issues", type: :system do
+  let(:project) { create(:project, name: "Potato API") }
+
+  before { driven_by :selenium, using: :headless_chrome }
+
+  describe "creating an issue" do
+    it "shows the new issue on the project page after creation" do
+      visit new_project_issue_path(project)
+
+      fill_in "Title",       with: "Login button broken"
+      fill_in "Author name", with: "Alice"
+      fill_in "Description", with: "Clicking login does nothing on Safari"
+      select  "Open",        from: "Status"
+
+      click_on "Create Issue"
+
+      expect(page).to have_content("Issue was successfully created")
+      expect(page).to have_content("Login button broken")
+    end
+
+    it "shows validation errors when title is blank" do
+      visit new_project_issue_path(project)
+
+      fill_in "Author name", with: "Alice"
+      click_on "Create Issue"
+
+      expect(page).to have_content("Title can't be blank")
+      expect(page).to have_current_path(project_issues_path(project))
+    end
+  end
+
+  describe "listing issues" do
+    before do
+      create(:issue, project: project, title: "First bug",   status: :open)
+      create(:issue, project: project, title: "Second bug",  status: :closed)
+    end
+
+    it "lists all issues for the project" do
+      visit project_issues_path(project)
+
+      expect(page).to have_content("First bug")
+      expect(page).to have_content("Second bug")
+    end
+
+    it "shows the status badge for each issue" do
+      visit project_issues_path(project)
+
+      within(".issue-row", text: "First bug")  { expect(page).to have_content("open")   }
+      within(".issue-row", text: "Second bug") { expect(page).to have_content("closed") }
+    end
+  end
+end
+```
+
+---
+
+### Database cleaner strategy for system tests
+
+System tests run in a separate thread (or process) from the test database connection. The default `transaction` rollback strategy that RSpec uses for unit tests **does not work** across threads — the browser-driven request uses a different connection and cannot see the rolled-back transaction.
+
+**Fix — use `truncation` for system tests:**
+
+```ruby
+# spec/support/database_cleaner.rb
+RSpec.configure do |config|
+  config.before(:suite)    { DatabaseCleaner.clean_with(:truncation) }
+
+  config.before(:each) do |example|
+    strategy = example.metadata[:type] == :system ? :truncation : :transaction
+    DatabaseCleaner.strategy = strategy
+    DatabaseCleaner.start
+  end
+
+  config.after(:each) { DatabaseCleaner.clean }
+end
+```
+
+Or with `database_cleaner-active_record`:
+
+```ruby
+config.before(:each, type: :system) { DatabaseCleaner.strategy = :truncation }
+config.before(:each)                { DatabaseCleaner.strategy = :transaction }
+```
+
+---
+
+### Debugging failing system tests
+
+```ruby
+# Take a screenshot at any point
+save_screenshot("debug.png")
+save_and_open_screenshot       # opens in your browser
+
+# Dump the current page HTML
+save_and_open_page
+
+# Pause execution — useful with non-headless drivers
+binding.pry   # or byebug
+
+# Run a specific example non-headlessly to watch it
+before { driven_by :selenium, using: :chrome }
+```
+
+**On CI** — configure Capybara to save screenshots of failures automatically:
+
+```ruby
+# spec/support/capybara.rb
+RSpec.configure do |config|
+  config.after(:each, type: :system) do |example|
+    if example.exception
+      save_screenshot("tmp/screenshots/#{example.description.parameterize}.png")
+    end
+  end
+end
+```
+
+---
+
+### Capybara configuration reference
+
+```ruby
+# spec/support/capybara.rb
+Capybara.configure do |config|
+  config.default_max_wait_time  = 5          # seconds to wait for async content
+  config.default_driver         = :rack_test # for non-JS tests (fast)
+  config.javascript_driver      = :cuprite   # for JS tests (tag with js: true)
+  config.app_host               = "http://localhost"
+  config.server_port            = 3001       # avoid clashing with dev server
+  config.save_path              = "tmp/capybara"
+  config.ignore_hidden_elements = :visible   # only interact with visible elements
+end
+```
+
+Tag a test as JavaScript-only when you need the JS driver:
+
+```ruby
+it "submits the form via AJAX", js: true do
+  visit new_project_issue_path(project)
+  # ... Capybara will use javascript_driver for this example only
+end
+```
+
+---
+
+### Capybara vs request specs — when to use each
+
+| | Request spec | System test |
+| --- | --- | --- |
+| Driver | `rack_test` (no browser) | Selenium / Cuprite (real browser) |
+| JavaScript | ❌ Not tested | ✅ Fully tested |
+| Speed | ⚡ Very fast | 🐢 Slower |
+| Tests | Controllers, JSON, redirects, status codes | Full user flows, forms, JS interactions |
+| Database cleaner | Transaction (fast) | Truncation (slower but correct) |
+| Best for | API behaviour, rendering, auth | Critical user journeys, form submissions |
+
+Use **request specs** for most controller behaviour. Use **system tests** for the handful of user journeys that matter most — the happy path for creating, editing, and deleting records; any flow that involves JavaScript.
+
+---
+
+### Capybara & System Tests — Interview Q&A
+
+**Q: What is Capybara and what problem does it solve?**
+Capybara is a Ruby DSL for browser automation. It sits on top of swappable drivers (Selenium, Cuprite, rack_test) and provides a human-readable API for navigating, interacting with, and asserting on web pages. It solves the problem of writing browser tests that read like user stories (`fill_in "Title", with: "…"`, `click_on "Submit"`, `expect(page).to have_content(…)`) without being coupled to a specific browser or protocol.
+
+**Q: What is the difference between a driver and Capybara itself?**
+Capybara is the DSL — it knows nothing about browsers. A driver is the adapter that translates Capybara commands into browser actions. `rack_test` simulates HTTP in-process with no browser. Selenium drives Chrome or Firefox via WebDriver. Cuprite drives Chrome via the Chrome DevTools Protocol directly. You can switch drivers without changing test code.
+
+**Q: Why can't you use `rack_test` for JavaScript tests?**
+`rack_test` makes HTTP requests directly to the Rack application in the same process — there is no browser, no rendering engine, and no JavaScript runtime. It cannot execute JS, respond to AJAX, or test anything that requires a real browser. For JavaScript behaviour you need Selenium or Cuprite.
+
+**Q: Why does Capybara automatically wait, and when does it time out?**
+Capybara retries DOM queries and assertions for up to `Capybara.default_max_wait_time` seconds (default: 2s). This handles asynchronous content: AJAX responses, turbo frames, animations, and JavaScript-rendered elements. If the condition isn't met within the timeout, the assertion fails. You can override per-assertion with `wait: N` or globally with `Capybara.default_max_wait_time = N`.
+
+**Q: Why does the `transaction` database cleaner strategy break system tests?**
+System tests drive a real browser, which sends HTTP requests that are handled by Rails in a separate thread (or process). That thread uses a different database connection than the test thread. A transaction opened in the test thread is invisible to other connections — so records created inside a `DatabaseCleaner.strategy = :transaction` block won't be visible to the browser-driven requests. The `truncation` strategy clears the database at the end of the test without relying on a shared transaction, so both connections see the same data.
+
+**Q: What is Cuprite and why is it preferred over Selenium for headless testing?**
+Cuprite drives Chrome directly via the Chrome DevTools Protocol, eliminating the ChromeDriver intermediary required by Selenium. This makes it significantly faster to start and more reliable under load. It supports the full Capybara DSL, has no external dependencies beyond Chrome itself, and is the recommended driver for headless system tests in modern Rails applications.
+
+**Q: How do you debug a failing system test?**
+`save_screenshot` / `save_and_open_screenshot` captures the page at the point of failure. `save_and_open_page` dumps the HTML. Running the test with a non-headless driver (`:selenium, using: :chrome`) lets you watch the browser interact with the page. On CI, configure an `after(:each)` hook that saves a screenshot whenever `example.exception` is non-nil, so failures are always captured even in headless mode.

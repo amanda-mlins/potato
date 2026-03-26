@@ -16,14 +16,12 @@ class Issue < ApplicationRecord
   scope :recent,      -> { order(created_at: :desc) }
   scope :by_status,   ->(status) { where(status: status) }
   scope :with_labels, -> { includes(:labels) }
-end
 
-private
+  private
 
-def author_name_cannot_contain_digits
-  return if author_name.blank?
+  def author_name_cannot_contain_digits
+    return if author_name.blank?
 
-  if author_name.match?(/\d/)
-    errors.add(:author_name, "cannot contain numbers")
+    errors.add(:author_name, "cannot contain numbers") if author_name.match?(/\d/)
   end
 end
