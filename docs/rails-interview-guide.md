@@ -29,6 +29,10 @@
 19. [Foreign Keys, Database Locks & Constraint Patterns](#19-foreign-keys-database-locks--constraint-patterns)
 20. [Migration Methods — `change` vs `up`/`down`](#20-migration-methods--change-vs-updown)
 21. [Testing with RSpec — The GitLab Way](#21-testing-with-rspec--the-gitlab-way)
+22. [Ruby Particularities — Truthiness, Identity & Gotchas](#22-ruby-particularities--truthiness-identity--gotchas)
+23. [Multi-Format Responses — `respond_to` and the JSON API Pattern](#23-multi-format-responses--respond_to-and-the-json-api-pattern)
+24. [Jbuilder — JSON View Templates](#24-jbuilder--json-view-templates)
+25. [Where Logic Lives — Model, Controller, Service Object & Beyond](#25-where-logic-lives--model-controller-service-object--beyond)
 
 ---
 
@@ -3444,3 +3448,811 @@ HTTP semantics: 204 No Content means the operation succeeded and there is no bod
 
 **Q: How do you customise what gets serialised to JSON?**
 `render json:` calls `to_json` on the object. You can pass `only:`, `except:`, and `include:` options to `as_json` / `to_json`, or use a dedicated serialiser — Jbuilder (view templates), ActiveModelSerializers, or JSONAPI::Serializer — for more complex shapes.
+
+---
+
+## 24. Jbuilder — JSON View Templates
+
+Jbuilder is a DSL gem (shipped with Rails by default) that lets you build JSON responses in dedicated view files instead of inline `render json:` calls in the controller. The template naming follows the same convention as ERB: `app/views/<controller>/<action>.json.jbuilder`.
+
+---
+
+### Why Jbuilder over `render json:`
+
+| | `render json: @record` | Jbuilder template |
+| --- | --- | --- |
+| Where presentation logic lives | Controller | View (correct layer) |
+| Field control | `as_json` options scattered in controller | Explicit, one field per line |
+| Nested associations | `include:` chains get unwieldy | `json.key collection { }` reads clearly |
+| Reuse | Duplicated across actions | Extract shared partials (`_issue.json.jbuilder`) |
+| Accidental data leaks | Easy — all columns by default | Hard — you list every field explicitly |
+
+---
+
+### How Rails finds the template
+
+When `format.json` has **no block**, Rails looks for a view template matching the action and format:
+
+```ruby
+# controller
+def show
+  respond_to do |format|
+    format.html           # → show.html.erb
+    format.json           # → show.json.jbuilder  (no block needed)
+  end
+end
+```
+
+If a block IS provided (`format.json { render json: @issue }`), the block takes priority and no template is consulted.
+
+---
+
+### Core Jbuilder methods
+
+#### `json.key value` — set a single field
+
+```ruby
+json.id    @issue.id       # "id": 1
+json.title @issue.title    # "title": "Login broken"
+```
+
+#### `json.extract! object, :field1, :field2` — pull multiple fields at once
+
+```ruby
+json.extract! @issue, :id, :title, :status, :author_name, :created_at
+# equivalent to writing json.id / json.title / etc. individually
+```
+
+#### `json.key object, :field1, :field2` — extract fields under a key
+
+```ruby
+json.project @issue.project, :id, :name
+# "project": { "id": 1, "name": "My Project" }
+```
+
+#### `json.array! collection { }` — root-level array
+
+```ruby
+json.array! @issues do |issue|
+  json.extract! issue, :id, :title, :status
+end
+# [ { "id": 1, ... }, { "id": 2, ... } ]
+```
+
+#### `json.key collection { }` — nested array under a key
+
+```ruby
+json.labels @issue.labels do |label|
+  json.extract! label, :id, :name, :color
+end
+# "labels": [ { "id": 1, "name": "bug", "color": "#ff0000" } ]
+```
+
+#### `json.key do … end` — nested object
+
+```ruby
+json.project do
+  json.id   @issue.project.id
+  json.name @issue.project.name
+  json.url  project_url(@issue.project)
+end
+# "project": { "id": 1, "name": "...", "url": "..." }
+```
+
+#### `json.url` — route helpers work directly
+
+```ruby
+json.url project_url(@project)    # full URL: "http://localhost:3000/projects/1"
+json.path project_path(@project)  # path only: "/projects/1"
+```
+
+---
+
+### Real templates from this project
+
+#### `app/views/projects/index.json.jbuilder`
+
+```ruby
+json.array! @projects do |project|
+  json.id          project.id
+  json.name        project.name
+  json.description project.description
+  json.created_at  project.created_at
+  json.updated_at  project.updated_at
+  json.url         project_url(project)
+end
+```
+
+Output for `GET /projects.json`:
+
+```json
+[
+  {
+    "id": 1,
+    "name": "Potato App",
+    "description": "A learning project",
+    "created_at": "2026-03-25T10:00:00.000Z",
+    "updated_at": "2026-03-25T10:00:00.000Z",
+    "url": "http://localhost:3000/projects/1"
+  }
+]
+```
+
+#### `app/views/projects/show.json.jbuilder`
+
+```ruby
+json.id          @project.id
+json.name        @project.name
+json.description @project.description
+json.created_at  @project.created_at
+json.url         project_url(@project)
+
+json.issues @project.issues.recent do |issue|
+  json.id          issue.id
+  json.title       issue.title
+  json.status      issue.status
+  json.author_name issue.author_name
+  json.created_at  issue.created_at
+  json.url         issue_url(issue)
+
+  json.labels issue.labels do |label|
+    json.extract! label, :id, :name, :color
+  end
+end
+```
+
+Output for `GET /projects/1.json`:
+
+```json
+{
+  "id": 1,
+  "name": "Potato App",
+  "description": "A learning project",
+  "created_at": "2026-03-25T10:00:00.000Z",
+  "url": "http://localhost:3000/projects/1",
+  "issues": [
+    {
+      "id": 3,
+      "title": "Login broken",
+      "status": "open",
+      "author_name": "Alice",
+      "created_at": "2026-03-25T11:00:00.000Z",
+      "url": "http://localhost:3000/issues/3",
+      "labels": [
+        { "id": 1, "name": "bug", "color": "#ff0000" }
+      ]
+    }
+  ]
+}
+```
+
+#### `app/views/issues/show.json.jbuilder`
+
+```ruby
+json.id          @issue.id
+json.title       @issue.title
+json.description @issue.description
+json.status      @issue.status
+json.author_name @issue.author_name
+json.created_at  @issue.created_at
+json.updated_at  @issue.updated_at
+json.url         issue_url(@issue)
+
+json.labels @issue.labels do |label|
+  json.extract! label, :id, :name, :color
+end
+
+json.project do
+  json.id   @issue.project.id
+  json.name @issue.project.name
+  json.url  project_url(@issue.project)
+end
+```
+
+---
+
+### Shared partials — avoiding repetition
+
+When the same JSON shape appears in multiple templates, extract it to a partial. Rails partial naming for Jbuilder follows the same `_name.json.jbuilder` convention:
+
+```ruby
+# app/views/issues/_issue.json.jbuilder
+json.extract! issue, :id, :title, :status, :author_name, :created_at
+json.url issue_url(issue)
+```
+
+Then render it from any template:
+
+```ruby
+# app/views/projects/show.json.jbuilder
+json.issues @project.issues do |issue|
+  json.partial! "issues/issue", issue: issue
+end
+
+# app/views/issues/index.json.jbuilder
+json.array! @issues, partial: "issues/issue", as: :issue
+```
+
+---
+
+### N+1 awareness with Jbuilder
+
+Jbuilder templates iterate over associations. If those associations aren't preloaded, every iteration fires a new query. Always eager-load in the controller before passing data to the template:
+
+```ruby
+# controller — preload before the template iterates
+def show
+  @project = Project.includes(issues: :labels).find(params[:id])
+  respond_to do |format|
+    format.html
+    format.json
+  end
+end
+```
+
+Without `includes(issues: :labels)`, the `show.json.jbuilder` template above would fire:
+
+- 1 query for the project
+- 1 query per issue to load labels → N+1
+
+---
+
+### Jbuilder — Interview Q&A
+
+**Q: What is Jbuilder and why use it?**
+Jbuilder is a Rails-bundled DSL for building JSON responses as view templates (`.json.jbuilder` files). It keeps JSON presentation logic in the view layer where it belongs, gives you explicit control over which fields are exposed, and supports partials for reuse — unlike `render json:` which serialises everything by default and clutters the controller.
+
+**Q: How does Rails know to use a Jbuilder template?**
+When `format.json` in `respond_to` has no block, Rails looks for `app/views/<controller>/<action>.json.jbuilder` — exactly the same lookup as ERB templates. If a block is provided, the block wins and no template is consulted.
+
+**Q: What's `json.extract!` and when do you use it?**
+`json.extract! object, :field1, :field2` is shorthand for writing `json.field1 object.field1` etc. individually. Use it when you want to expose several fields from the same object without customising the keys — it's more concise. If you need to rename keys or transform values, write them out individually instead.
+
+**Q: How do you avoid N+1 queries in Jbuilder templates?**
+Jbuilder templates iterate over associations lazily — if the association isn't loaded, ActiveRecord fires a query per record. The fix is the same as everywhere else in Rails: eager-load with `includes` in the controller action before the template renders.
+
+```ruby
+# In the controller action:
+@issues = @project.issues.includes(:labels).recent
+```
+
+---
+
+## 25. Where Logic Lives — Model, Controller, Service Object & Beyond
+
+One of the most common interview topics — and one of the most common code-review flashpoints — is *separation of concerns*: which layer of a Rails app should own which kind of logic? This section covers the Rails convention, the GitLab engineering standard (sourced directly from [docs.gitlab.com/development/software_design](https://docs.gitlab.com/development/software_design/) and the GitLab engineering handbook), and how those rules play out in this project.
+
+---
+
+### The core principle: each layer has one job
+
+> "Design software around use-cases, not entities." — GitLab Software Design Guide
+
+Rails gives you MVC. In practice, real apps need more layers. Here is the complete picture:
+
+| Layer | Location | Owns |
+| --- | --- | --- |
+| Model | `app/models/` | Persistence, validations, associations, scopes, domain invariants |
+| Controller | `app/controllers/` | HTTP request/response cycle — nothing else |
+| Service Object | `app/services/` | A single, named business use-case |
+| Worker (Sidekiq) | `app/workers/` | Async/background execution of a service or side-effect |
+| Presenter / Decorator | `app/presenters/` | View-layer formatting; keeps models and views clean |
+| Policy | `app/policies/` | Authorization — who can do what |
+| Serializer / Jbuilder | `app/serializers/`, `app/views/*.json.jbuilder` | JSON representation |
+| Validator | `app/validators/` | Reusable, cross-model validation logic |
+| Form Object | `app/forms/` | Multi-model form submission logic |
+| Query Object | `app/finders/` | Complex database queries extracted from models |
+
+---
+
+### The Model — domain rules only
+
+The model is responsible for **data and invariants**. It should know nothing about HTTP, nothing about the current user session, and nothing about how data is rendered.
+
+**What belongs in the model:**
+
+```ruby
+class Issue < ApplicationRecord
+  # ✅ Associations — model owns its relationships
+  belongs_to :project
+  has_many :issue_labels, dependent: :destroy
+  has_many :labels, through: :issue_labels
+
+  # ✅ Enums — domain concept
+  enum :status, { open: 0, in_progress: 1, closed: 2 }
+
+  # ✅ Validations — guard the domain invariant
+  validates :title, presence: true, length: { maximum: 255 }, no_profanity: true
+  validates :author_name, presence: true
+  validate :author_name_cannot_contain_digits
+
+  # ✅ Scopes — named, reusable query fragments
+  scope :recent,      -> { order(created_at: :desc) }
+  scope :by_status,   ->(status) { where(status: status) }
+  scope :with_labels, -> { includes(:labels) }
+
+  private
+
+  # ✅ Domain rule expressed as a method
+  def author_name_cannot_contain_digits
+    return if author_name.blank?
+    errors.add(:author_name, "cannot contain numbers") if author_name.match?(/\d/)
+  end
+end
+```
+
+**What does NOT belong in the model:**
+
+```ruby
+# ❌ HTTP / session knowledge
+def self.for_current_user(session)
+  where(user_id: session[:user_id])
+end
+
+# ❌ Email sending / side effects unrelated to persistence
+after_create :send_notification_email
+
+# ❌ Authorization decisions
+def can_be_edited_by?(user)
+  user.admin? || user == self.creator   # belongs in a Policy
+end
+
+# ❌ Formatting for display
+def formatted_created_at
+  created_at.strftime("%B %d, %Y")     # belongs in a Presenter
+end
+```
+
+---
+
+### GitLab on Omniscient (God) Models
+
+GitLab's [Software Design guide](https://docs.gitlab.com/development/software_design/#taming-omniscient-classes) explicitly warns against god objects:
+
+> "We must consider not adding new data and behavior to omniscient classes. We consider `Project`, `User`, `MergeRequest`, `Ci::Pipeline` and any classes above 1000 LOC to be omniscient."
+
+Their rule of thumb: if adding a method to a model also pulls in several private helpers, those helpers belong in a dedicated class. The real GitLab codebase uses bounded-context namespaces (`AntiAbuse::UserTrustScore`, `Integrations::ProjectIntegrations`) to pull logic out of `User` and `Project`.
+
+Applied to this project — if `Issue` started accumulating "close issue", "reopen issue", "assign label" methods, each would become a service object: `Issues::CloseService`, `Issues::ReopenService`, `Issues::AddLabelService`.
+
+---
+
+### The Controller — HTTP only
+
+The controller is an **adapter between HTTP and your domain**. Its job is:
+
+1. Parse and permit params
+2. Call a model or service
+3. Respond (redirect, render, JSON)
+
+That's it. If you find yourself writing more than ~10 lines of logic in a controller action, extract it.
+
+```ruby
+# ✅ Correct controller — thin, HTTP-only
+class IssuesController < ApplicationController
+  before_action :set_project
+  before_action :set_issue, only: [:show, :edit, :update, :destroy]
+
+  def create
+    @issue = @project.issues.new(issue_params)   # model handles validation
+    respond_to do |format|
+      if @issue.save                              # persistence in model
+        format.html { redirect_to @issue, notice: "Issue created." }
+        format.json { render json: @issue, status: :created }
+      else
+        format.html { render :new, status: :unprocessable_content }
+        format.json { render json: @issue.errors, status: :unprocessable_content }
+      end
+    end
+  end
+
+  private
+
+  def issue_params
+    params.require(:issue).permit(:title, :description, :author_name, :status)
+  end
+end
+```
+
+**What does NOT belong in the controller:**
+
+```ruby
+# ❌ Business logic
+def create
+  issue = Issue.new(issue_params)
+  if issue.save
+    # send email, update counters, create audit log...  → service object
+  end
+end
+
+# ❌ Database queries beyond simple finds
+def index
+  @open = Issue.where(status: :open).where("created_at > ?", 30.days.ago)
+    .joins(:labels).where(labels: { name: "bug" })   # → scope or query object
+end
+
+# ❌ Authorization logic inline
+def update
+  if current_user.admin? || current_user == @issue.author
+    # ...                                             # → policy object
+  end
+end
+```
+
+---
+
+### Service Objects — one use-case, one class
+
+When an action involves more than one model, has side effects (email, audit log, webhooks), or requires complex permission checks, it belongs in a service object.
+
+GitLab's naming convention from the software design guide:
+
+```ruby
+# Good — ubiquitous language, not CRUD
+Issues::CloseService              # not Issues::UpdateStatusService
+Epic::AddExistingIssueService
+Projects::CreateService           # OK if it matches product language
+
+# Bad — CRUD jargon that adds confusion
+EpicIssues::CreateService         # ambiguous: create the record or add to an epic?
+```
+
+**Structure of a GitLab-style service object:**
+
+```ruby
+# app/services/issues/close_service.rb
+module Issues
+  class CloseService
+    def initialize(issue:, current_user:)
+      @issue = issue
+      @current_user = current_user
+    end
+
+    def execute
+      return ServiceResponse.error(message: "Not authorized") unless authorized?
+
+      @issue.update!(status: :closed, closed_at: Time.current)
+      notify_subscribers
+      create_audit_event
+
+      ServiceResponse.success(payload: { issue: @issue })
+    end
+
+    private
+
+    def authorized?
+      @current_user.admin? || @issue.project.member?(@current_user)
+    end
+
+    def notify_subscribers
+      IssueMailer.closed_notification(@issue).deliver_later
+    end
+
+    def create_audit_event
+      AuditEvent.create!(author: @current_user, target: @issue, action: "closed")
+    end
+  end
+end
+```
+
+**Called from the controller:**
+
+```ruby
+def destroy
+  result = Issues::CloseService.new(issue: @issue, current_user: current_user).execute
+  respond_to do |format|
+    if result.success?
+      format.html { redirect_to project_issues_path(@issue.project), notice: "Closed." }
+      format.json { head :no_content }
+    else
+      format.json { render json: { error: result.message }, status: :forbidden }
+    end
+  end
+end
+```
+
+**Why service objects instead of fat models or fat controllers:**
+
+- A single permission check guards the whole use-case — no scattered `if user.admin?` across views and controllers
+- Side effects are explicit and co-located
+- Testable in isolation without HTTP overhead
+- Different use-cases (close vs delete vs reopen) don't bleed into each other
+
+---
+
+### Workers (Sidekiq) — async execution
+
+If a service object involves slow or non-critical work (email, webhooks, search indexing), move the slow parts to a Sidekiq worker:
+
+```ruby
+# app/workers/issues/close_notification_worker.rb
+module Issues
+  class CloseNotificationWorker
+    include Sidekiq::Worker
+
+    sidekiq_options queue: :default, retry: 3
+
+    def perform(issue_id, user_id)
+      issue = Issue.find(issue_id)
+      user  = User.find(user_id)
+      IssueMailer.closed_notification(issue, user).deliver_now
+    end
+  end
+end
+```
+
+Called from the service:
+
+```ruby
+Issues::CloseNotificationWorker.perform_async(@issue.id, @current_user.id)
+```
+
+**Rules from GitLab's guide:**
+
+- Workers must be backwards-compatible across deploys — the queue may contain jobs from the previous version of the code
+- Never change a worker method signature without a two-release migration strategy (accept both old and new arguments in the first release)
+- Workers should be idempotent — safe to retry on failure
+
+---
+
+### Presenters / Decorators — view formatting
+
+Formatting logic (date formats, truncation, CSS classes derived from state) does not belong in models or views. It belongs in a presenter:
+
+```ruby
+# app/presenters/issue_presenter.rb
+class IssuePresenter
+  def initialize(issue)
+    @issue = issue
+  end
+
+  def status_badge_class
+    { "open" => "badge-success", "in_progress" => "badge-warning", "closed" => "badge-secondary" }
+      .fetch(@issue.status, "badge-light")
+  end
+
+  def created_at_display
+    @issue.created_at.strftime("%b %d, %Y")
+  end
+
+  def truncated_description(limit = 100)
+    @issue.description&.truncate(limit)
+  end
+end
+
+# In the view:
+presenter = IssuePresenter.new(@issue)
+presenter.status_badge_class   # => "badge-success"
+presenter.created_at_display   # => "Mar 25, 2026"
+```
+
+---
+
+### Query Objects / Finders — complex queries
+
+Complex queries with multiple conditions, joins, or dynamic filters can overwhelm a model's scope chain. GitLab uses a `Finders` pattern:
+
+```ruby
+# app/finders/issues_finder.rb
+class IssuesFinder
+  def initialize(project:, params: {})
+    @project = project
+    @params  = params
+  end
+
+  def execute
+    scope = @project.issues
+    scope = scope.by_status(@params[:status])   if @params[:status].present?
+    scope = scope.with_labels                   if @params[:with_labels]
+    scope = scope.recent
+    scope
+  end
+end
+
+# In the controller:
+@issues = IssuesFinder.new(project: @project, params: filter_params).execute
+```
+
+This keeps the `Issue` model clean and makes the finder independently testable.
+
+---
+
+### Validators — reusable validation logic
+
+When a validation rule applies across multiple models, extract it into `app/validators/`:
+
+```ruby
+# app/validators/no_profanity_validator.rb  (already in this project)
+class NoProfanityValidator < ActiveModel::EachValidator
+  DEFAULT_BLACKLIST = %w[foo bar baz]
+
+  def initialize(options)
+    super
+    @blacklist = Array(options[:words]) + DEFAULT_BLACKLIST
+  end
+
+  def validate_each(record, attribute, value)
+    return if value.blank?
+    found = @blacklist.find { |word| value.to_s.downcase.include?(word.downcase) }
+    return unless found
+    message = options[:message] || "contains disallowed word: #{found}"
+    record.errors.add(attribute, message)
+  end
+end
+
+# Usable in any model:
+validates :title,   no_profanity: true
+validates :content, no_profanity: { words: %w[spam] }
+```
+
+Contrast with **inline validation** (`validate :method_name`), which is model-specific and does not need to be reused:
+
+```ruby
+# In Issue model — specific to this model's domain rule
+validate :author_name_cannot_contain_digits
+
+private
+
+def author_name_cannot_contain_digits
+  return if author_name.blank?
+  errors.add(:author_name, "cannot contain numbers") if author_name.match?(/\d/)
+end
+```
+
+**Rule of thumb**: if the validation logic will be used in exactly one model, use an inline `validate` method. If it crosses models, use a validator class.
+
+---
+
+### GitLab's Bounded Contexts — namespaces as domain guardrails
+
+GitLab's [software design guide](https://docs.gitlab.com/development/software_design/#bounded-contexts) introduces the concept of bounded contexts enforced through Ruby namespaces:
+
+> "We should expect any class to be defined inside a module/namespace that represents the contexts where it operates."
+
+What this means in practice:
+
+```ruby
+# ❌ Bad — no context, leaks into the global namespace
+class JobArtifact; end
+
+# ✅ Good — nested under the CI bounded context
+module Ci
+  class JobArtifact; end
+end
+
+# ❌ Bad — CRUD name, ambiguous context
+class EpicIssues::CreateService; end
+
+# ✅ Good — ubiquitous language inside a domain namespace
+class Epic::AddExistingIssueService; end
+```
+
+For this project, the same principle applies:
+
+```text
+app/
+  services/
+    issues/
+      close_service.rb          # Issues:: bounded context
+      reopen_service.rb
+    projects/
+      archive_service.rb        # Projects:: bounded context
+  workers/
+    issues/
+      close_notification_worker.rb
+  finders/
+    issues_finder.rb
+  presenters/
+    issue_presenter.rb
+  validators/
+    no_profanity_validator.rb
+```
+
+---
+
+### The "design around use-cases" rule
+
+GitLab's guide is explicit:
+
+> "Rails encourages entity-centric software. This anti-pattern manifests as: different preconditions checked for different use-cases in the same service, different permissions checked in the same abstraction, different side-effects triggered by 'if field X changed, do Y'."
+
+**Anti-pattern** — one bloated service handles two completely different actors:
+
+```ruby
+# ❌ Bad — Groups::UpdateService handles two different actors and permission sets
+class Groups::UpdateService
+  def execute
+    if params[:shared_runners_minutes_limit]   # only instance admins
+      # ...
+    elsif params[:description]                 # any group admin
+      # ...
+    end
+  end
+end
+```
+
+**Solution** — separate services for separate use-cases:
+
+```ruby
+# ✅ Good — each service has one actor, one permission check, one cohesive set of params
+class Groups::UpdateService; end               # group admin, description/avatar/settings
+class Ci::Minutes::UpdateLimitService; end     # instance admin, quota only
+```
+
+Applied to this project:
+
+```ruby
+# ❌ Avoid
+class Issues::UpdateService
+  def execute
+    if params[:status] == "closed"
+      # close logic, notifications, audit log...
+    elsif params[:label_ids]
+      # label update logic, webhooks...
+    end
+  end
+end
+
+# ✅ Prefer
+class Issues::CloseService; end
+class Issues::AddLabelService; end
+class Issues::RemoveLabelService; end
+```
+
+---
+
+### Quick-reference decision table
+
+| Situation | Where it goes |
+| --- | --- |
+| Validate data before saving | Model (`validates` / `validate :method`) — or `app/validators/` if reusable across models |
+| Association, enum, scope | Model |
+| Parse params, call model/service, redirect/render | Controller |
+| Business logic touching > 1 model or with side effects | Service object (`app/services/`) |
+| Authorization (can user X do Y?) | Policy object (`app/policies/`) |
+| Slow work: email, webhooks, indexing | Sidekiq worker (`app/workers/`) |
+| Date formatting, badge classes, display helpers | Presenter (`app/presenters/`) |
+| Complex DB query with dynamic filters | Finder / query object (`app/finders/`) |
+| JSON shape definition | Jbuilder template or serializer |
+| Reusable multi-model validation | Validator class (`app/validators/`) |
+
+---
+
+### Where logic lives in this project
+
+| Concern | File |
+| --- | --- |
+| Issue validations (presence, length, no profanity, no digit author) | `app/models/issue.rb` |
+| Reusable profanity check | `app/validators/no_profanity_validator.rb` |
+| HTTP request/response for issues | `app/controllers/issues_controller.rb` |
+| HTTP request/response for projects | `app/controllers/projects_controller.rb` |
+| JSON shape for project list | `app/views/projects/index.json.jbuilder` |
+| JSON shape for project + its issues | `app/views/projects/show.json.jbuilder` |
+| JSON shape for single issue + labels | `app/views/issues/show.json.jbuilder` |
+| (future) Close / reopen workflow | `app/services/issues/close_service.rb` |
+| (future) Async notifications | `app/workers/issues/close_notification_worker.rb` |
+
+---
+
+### Where Logic Lives — Interview Q&A
+
+**Q: What is the "fat model, skinny controller" rule and why is it considered incomplete?**
+"Fat model, skinny controller" moves business logic from controllers into models — better than bloated controllers. But taken too far it creates god models: a `User` or `Project` with thousands of lines spanning dozens of domains. The complete answer is: models own *domain invariants and persistence*, controllers own *HTTP*, and anything more complex goes into service objects, workers, presenters, or finders.
+
+**Q: When do you extract a service object?**
+When an action: (a) touches more than one model, (b) has side effects like email, webhooks, or audit logs, (c) needs a single authorization check guarding the whole operation, or (d) represents a named business use-case testable in isolation. A useful heuristic: if you are writing more than ~10 lines of business logic in a controller action, extract it.
+
+**Q: How does GitLab name service objects?**
+GitLab uses ubiquitous language — the name matches what users do, not what database operation occurs. `Epic::AddExistingIssueService` instead of `EpicIssues::CreateService`. `Issues::CloseService` instead of `Issues::UpdateStatusService`. This makes code searchable and avoids translation overhead for readers.
+
+**Q: What is the difference between a validator class and an inline `validate` method?**
+An inline `validate :method_name` lives inside one model and encodes a rule specific to that model's domain (e.g., "author name cannot contain digits" belongs to `Issue`). A validator class inheriting from `ActiveModel::EachValidator` lives in `app/validators/` and can be reused across any model with `validates :field, my_rule: true`. Use a class when the rule crosses models; use an inline method when it is specific to one.
+
+**Q: What goes in a presenter?**
+Formatting logic: display date strings, CSS class names derived from model state, text truncation, computed display-only attributes. Presenters keep models free of view concerns and views free of logic, and make formatting independently testable.
+
+**Q: What are Sidekiq workers for and what is the key constraint on them?**
+Background execution of slow or non-critical work: email delivery, external webhooks, search indexing, audit events. They are enqueued by service objects (not controllers). The key constraint is **backwards compatibility**: the Sidekiq queue is not drained during a deploy, so a worker running new code may process jobs enqueued by old code. Never change a `perform` signature without a two-release migration strategy.
+
+**Q: What does GitLab mean by "bounded contexts"?**
+A bounded context is a Ruby namespace that groups related domain classes. `Ci::`, `MergeRequests::`, `Issues::` are bounded contexts in GitLab's codebase. Code related to CI lives under `Ci::`, not scattered at the top level. This makes coupling visible — excessive cross-namespace imports signal a misplaced abstraction. GitLab enforces it with the `Gitlab/BoundedContexts` RuboCop cop.
