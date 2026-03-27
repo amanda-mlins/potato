@@ -936,3 +936,308 @@ Solid Queue's dispatcher process reads `config/recurring.yml` and enqueues jobs 
 
 ---
 
+
+## 27. Pagination — Pagy, Offset vs Cursor, and the JSON API Pattern
+
+When a project accumulates thousands of issues, returning all of them in a single query is a reliability hazard: it bloats memory, slows response time, and can time out the request entirely. Pagination is the standard solution. This section covers the strategies, the recommended gem, and the concrete implementation in this project.
+
+---
+
+### The two pagination strategies
+
+#### Offset pagination (page-based)
+
+The database skips a fixed number of rows and returns the next N:
+
+```sql
+SELECT * FROM issues ORDER BY created_at DESC LIMIT 25 OFFSET 500;
+```
+
+- **Pros**: simple, maps naturally to `?page=N` URLs, easy to link to arbitrary pages
+- **Cons**: `OFFSET 500` makes the database scan and discard 500 rows on every query — performance degrades linearly as you page deeper. Also suffers from "page drift": if a record is inserted or deleted between page requests, records can shift and appear twice or be skipped.
+
+#### Keyset / cursor pagination
+
+Instead of skipping rows, the query uses a pointer (the last seen primary key or timestamp) as the WHERE clause:
+
+```sql
+SELECT * FROM issues
+WHERE created_at < '2026-01-01 12:00:00'
+   OR (created_at = '2026-01-01 12:00:00' AND id < 1234)
+ORDER BY created_at DESC, id DESC
+LIMIT 25;
+```
+
+- **Pros**: O(1) at any depth (uses the index directly), no page drift, stable under inserts/deletes
+- **Cons**: no random-access (can't jump to page 47), harder to implement, requires a stable sort column with an index
+
+**When to use which:**
+
+| Situation | Use |
+| --- | --- |
+| Admin UI with page numbers | Offset (Pagy default) |
+| Infinite scroll / "load more" | Cursor (Pagy's `Pagy::Keyset`) |
+| Public API consumed by mobile apps | Cursor preferred |
+| Simple internal tool, < 100k rows | Offset — simpler, fast enough |
+| Feed or timeline at scale | Cursor — required |
+
+---
+
+### Why Pagy — not Kaminari or will_paginate
+
+Three gems exist. Here is the comparison:
+
+| | Pagy | Kaminari | will_paginate |
+| --- | --- | --- | --- |
+| Approach | Separate object, no model pollution | Extends ActiveRecord scope chain | Extends ActiveRecord scope chain |
+| Memory | Minimal — no extra AR objects | Loads count query on every page | Loads count query on every page |
+| Speed | ~40× faster than Kaminari (benchmark) | Baseline | Comparable to Kaminari |
+| Offset pagination | ✅ | ✅ | ✅ |
+| Keyset / cursor | ✅ `Pagy::Keyset` | ❌ | ❌ |
+| JSON metadata helper | ✅ `pagy_metadata` | Manual | Manual |
+| Used by GitLab | ✅ | ❌ (migrated away) | ❌ |
+| Rails 8 compatible | ✅ | ✅ | ✅ |
+
+Pagy keeps the pagination logic in a plain Ruby object (`Pagy`) rather than extending your models with scopes. This means your model stays clean, the page size is controlled by the controller, and the helper is available wherever you include it.
+
+---
+
+### Implementation in this project
+
+#### 1. Gemfile
+
+```ruby
+gem "pagy", "~> 9.0"
+```
+
+#### 2. `config/initializers/pagy.rb`
+
+```ruby
+require "pagy/extras/metadata"  # pagy_metadata for JSON responses
+require "pagy/extras/overflow"  # graceful handling of out-of-range pages
+
+Pagy::DEFAULT[:limit]    = 25          # records per page
+Pagy::DEFAULT[:overflow] = :last_page  # ?page=9999 → redirects to last page
+```
+
+#### 3. `app/controllers/application_controller.rb`
+
+```ruby
+class ApplicationController < ActionController::Base
+  include Pagy::Backend   # adds the pagy() method to all controllers
+end
+```
+
+#### 4. `app/helpers/application_helper.rb`
+
+```ruby
+module ApplicationHelper
+  include Pagy::Frontend  # adds pagy_nav() and pagy_metadata() to all views
+end
+```
+
+#### 5. `app/controllers/issues_controller.rb` — the index action
+
+```ruby
+def index
+  # pagy() wraps the relation, runs COUNT(*) + SELECT with LIMIT/OFFSET,
+  # and returns a [Pagy, ActiveRecord::Relation] pair
+  @pagy, @issues = pagy(@project.issues.with_labels.recent, limit: 25)
+
+  respond_to do |format|
+    format.html
+    format.json  # → app/views/issues/index.json.jbuilder
+  end
+end
+```
+
+`pagy()` reads `params[:page]` automatically. It runs two queries:
+
+1. `SELECT COUNT(*) FROM issues WHERE project_id = ?` — total count for nav rendering
+2. `SELECT * FROM issues WHERE project_id = ? ORDER BY created_at DESC LIMIT 25 OFFSET 0`
+
+**Critical: always order before paginating.** Without `ORDER BY`, the database returns rows in an arbitrary, non-deterministic order — different rows can appear on different pages across requests.
+
+#### 6. `app/views/issues/index.html.erb`
+
+```erb
+<% @issues.each do |issue| %>
+  <%# render each row ... %>
+<% end %>
+
+<%# renders <nav> with prev/next + numbered page links %>
+<%== pagy_nav(@pagy) %>
+
+<p>
+  Showing <%= @pagy.from %>–<%= @pagy.to %> of <%= @pagy.count %> issues
+</p>
+```
+
+`<%==` (double equals) renders the HTML unescaped — required for Pagy's nav markup.
+
+#### 7. `app/views/issues/index.json.jbuilder` — JSON envelope with metadata
+
+```ruby
+json.pagination do
+  json.current_page @pagy.page
+  json.total_pages  @pagy.last
+  json.total_count  @pagy.count
+  json.per_page     @pagy.limit
+  json.next_page    @pagy.next   # nil on last page
+  json.prev_page    @pagy.prev   # nil on first page
+end
+
+json.issues @issues do |issue|
+  json.id          issue.id
+  json.title       issue.title
+  json.status      issue.status
+  json.author_name issue.author_name
+  json.created_at  issue.created_at
+  json.labels      issue.labels.map(&:name)
+  json.url         issue_url(issue)
+end
+```
+
+**Example response:**
+
+```json
+{
+  "pagination": {
+    "current_page": 2,
+    "total_pages": 12,
+    "total_count": 291,
+    "per_page": 25,
+    "next_page": 3,
+    "prev_page": 1
+  },
+  "issues": [...]
+}
+```
+
+Clients use `pagination.next_page` to construct `?page=3` for the next request, and `pagination.total_pages` to know when to stop. This is the GitHub API and GitLab API pattern.
+
+---
+
+### Keyset pagination with `Pagy::Keyset` (for scale)
+
+For infinite-scroll UIs or high-volume APIs, switch to keyset pagination. No count query, no page drift, O(1) at any depth:
+
+```ruby
+# Controller — keyset mode
+def index
+  @pagy, @issues = pagy_keyset(
+    @project.issues.with_labels.order(:created_at, :id),
+    limit: 25
+  )
+  respond_to { |f| f.json }
+end
+```
+
+The response includes an opaque `next_cursor` token instead of a page number:
+
+```json
+{
+  "pagination": {
+    "next_cursor": "eyJjcmVhdGVkX2F0IjoiMjAyNi0wMS0wMSIsImlkIjoxMjM0fQ==",
+    "per_page": 25
+  },
+  "issues": [...]
+}
+```
+
+The client passes `?cursor=eyJ...` to get the next page. There is no `total_pages` or `total_count` — that requires a `COUNT(*)`, which is what keyset avoids.
+
+---
+
+### N+1 and pagination — the critical interaction
+
+Eager-loading is even more important with pagination. Without `includes`, every row in the 25-issue page fires a separate query for its labels:
+
+```ruby
+# ❌ 1 + 25 queries (1 for issues, 1 per issue for labels)
+@pagy, @issues = pagy(@project.issues.recent)
+
+# ✅ 2 queries total (1 for issues, 1 for all their labels)
+@pagy, @issues = pagy(@project.issues.with_labels.recent)
+```
+
+`scope :with_labels, -> { includes(:labels) }` is already defined in the `Issue` model. Always compose it before calling `pagy()`.
+
+---
+
+### Testing pagination
+
+```ruby
+# spec/requests/issues_spec.rb
+RSpec.describe "Issues", type: :request do
+  let(:project) { create(:project) }
+
+  before { create_list(:issue, 30, project: project) }
+
+  describe "GET /projects/:id/issues" do
+    it "paginates to 25 per page by default" do
+      get project_issues_path(project), as: :json
+
+      expect(response).to have_http_status(:ok)
+      body = response.parsed_body
+      expect(body["issues"].length).to eq(25)
+      expect(body["pagination"]["total_count"]).to eq(30)
+      expect(body["pagination"]["total_pages"]).to eq(2)
+      expect(body["pagination"]["next_page"]).to eq(2)
+    end
+
+    it "returns the second page" do
+      get project_issues_path(project), params: { page: 2 }, as: :json
+
+      body = response.parsed_body
+      expect(body["issues"].length).to eq(5)
+      expect(body["pagination"]["current_page"]).to eq(2)
+      expect(body["pagination"]["next_page"]).to be_nil
+    end
+
+    it "returns the last page for out-of-range page numbers" do
+      get project_issues_path(project), params: { page: 999 }, as: :json
+
+      body = response.parsed_body
+      expect(body["pagination"]["current_page"]).to eq(body["pagination"]["total_pages"])
+    end
+  end
+end
+```
+
+---
+
+### Where pagination logic lives
+
+Pagination sits in the controller — it is an HTTP/presentation concern, not a domain concern:
+
+```
+Controller     → pagy(@scope)          decides page size, reads params[:page]
+Model scope    → .with_labels.recent   owns ordering + eager-loading
+Jbuilder view  → json.pagination       owns JSON representation
+HTML view      → pagy_nav(@pagy)       owns navigation markup
+```
+
+**Do not** put `pagy` calls in service objects or models. The model does not know about HTTP request params. The service object does not know about page size. The controller is the right place.
+
+---
+
+### Pagination — Interview Q&A
+
+**Q: What is the performance problem with offset pagination at large page numbers?**
+`OFFSET N` forces the database to scan and discard the first N rows before returning results — even though those rows are never returned to the caller. This means a request for page 400 with 25 rows per page scans 10,000 rows. Execution time grows linearly with page depth. The index helps with ordering but cannot skip the offset scan. Keyset pagination avoids this entirely by using a `WHERE id < last_seen_id` clause that uses the index directly.
+
+**Q: Why do you need an ORDER BY clause when paginating?**
+Without a deterministic order, the database returns rows in heap order, which can change between requests as rows are inserted, updated, or vacuumed. A row can appear on two consecutive pages or be skipped entirely. `ORDER BY created_at DESC, id DESC` guarantees a stable, repeatable sort. The secondary sort on `id` breaks ties when multiple rows share the same `created_at` timestamp.
+
+**Q: What does Pagy return from its `pagy()` method?**
+A two-element array: a `Pagy` object containing metadata (current page, total pages, total count, limit, next/prev page numbers) and the paginated `ActiveRecord::Relation` that has `LIMIT` and `OFFSET` applied. The relation is still lazy — the database query doesn't run until you iterate it in the view.
+
+**Q: How do you expose pagination metadata in a JSON API?**
+Include `pagy/extras/metadata` in the initializer, then in the Jbuilder template build a `pagination` envelope with `@pagy.page`, `@pagy.last`, `@pagy.count`, `@pagy.next`, and `@pagy.prev`. Clients use `next_page` to construct the URL for the next request. `nil` for `next_page` signals the last page. This matches the GitHub/GitLab pagination API convention.
+
+**Q: When would you use keyset pagination instead of offset?**
+When the collection can be very large (millions of rows), when the UI uses infinite scroll rather than numbered pages, or when the API is consumed by mobile clients that can't tolerate the performance degradation of deep offsets. Keyset pagination is O(1) at any depth but cannot provide a total page count or allow jumping to an arbitrary page — those require a `COUNT(*)` which keyset deliberately avoids.
+
+**Q: Why is Pagy preferred over Kaminari in modern Rails apps?**
+Pagy is a plain Ruby object — it does not extend ActiveRecord models with scopes or add instance methods. It is roughly 40× faster and uses significantly less memory because it does not load or decorate AR objects for pagination purposes. It supports both offset and keyset strategies, provides a JSON metadata helper out of the box, and is what GitLab itself uses.

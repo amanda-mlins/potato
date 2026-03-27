@@ -1,0 +1,39 @@
+<h1><%= @project.name %> — Issues</h1>
+
+<%= link_to "New Issue", new_project_issue_path(@project) %>
+
+<table>
+  <thead>
+    <tr>
+      <th>Title</th>
+      <th>Status</th>
+      <th>Author</th>
+      <th>Labels</th>
+      <th>Created</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    <% @issues.each do |issue| %>
+      <tr class="issue-row">
+        <td><%= link_to issue.title, issue %></td>
+        <td><span class="badge"><%= issue.status %></span></td>
+        <td><%= issue.author_name %></td>
+        <td><%= issue.labels.map(&:name).join(", ") %></td>
+        <td><%= issue.created_at.strftime("%b %d, %Y") %></td>
+        <td>
+          <%= link_to "Edit", edit_issue_path(issue) %>
+          <%= button_to "Delete", issue, method: :delete, data: { turbo_confirm: "Delete this issue?" } %>
+        </td>
+      </tr>
+    <% end %>
+  </tbody>
+</table>
+
+<%# Pagy navigation — renders prev/next and page number links %>
+<%== pagy_nav(@pagy) %>
+
+<p>
+  Showing <%= @pagy.from %>–<%= @pagy.to %> of <%= @pagy.count %> issues
+  (page <%= @pagy.page %> of <%= @pagy.last %>)
+</p>

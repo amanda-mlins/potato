@@ -73,12 +73,13 @@ Sections 22–24 · ~825 lines
 
 ### [Part 5 — Architecture & Background Jobs](05-architecture.md)
 
-Sections 25–26 · ~935 lines
+Sections 25–26, + Pagination · ~1,300 lines
 
 | # | Topic |
 | --- | --- |
 | 25 | Where Logic Lives — Model, Controller, Service Object & Beyond |
 | 26 | Background Jobs — ActiveJob & Solid Queue |
+| 27 | Pagination — Pagy, Offset vs Cursor, and the JSON API Pattern |
 
 ---
 
@@ -108,3 +109,4 @@ Sections 25–26 · ~935 lines
 | GitLab bounded contexts | [Part 5](05-architecture.md) |
 | ActiveJob & Solid Queue | [Part 5](05-architecture.md) |
 | Sidekiq / background workers | [Part 5](05-architecture.md) |
+| Pagination — Pagy, offset vs cursor | [Part 5](05-architecture.md) |

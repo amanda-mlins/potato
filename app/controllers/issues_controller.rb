@@ -1,6 +1,15 @@
 class IssuesController < ApplicationController
-  before_action :set_project, only: %i[new create]
+  before_action :set_project, only: %i[index new create]
   before_action :set_issue, only: %i[show edit update destroy]
+
+  def index
+    @pagy, @issues = pagy(@project.issues.with_labels.recent, limit: 25)
+
+    respond_to do |format|
+      format.html
+      format.json # → app/views/issues/index.json.jbuilder
+    end
+  end
 
   def show
     respond_to do |format|
