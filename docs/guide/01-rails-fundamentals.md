@@ -61,7 +61,111 @@ default: &default
 
 ## 2. Database Migrations
 
-### Generating migrations
+### 2.1 What is a migration?
+
+A **migration** is a Ruby class that describes a single, incremental change
+to your database schema. Instead of writing raw SQL (`ALTER TABLE …`) and
+sharing it out-of-band, each change lives in a versioned file that is:
+
+- **tracked in Git** alongside the application code that depends on it
+- **repeatable** — any developer or CI server can replay the exact same
+  sequence from scratch
+- **reversible** — Rails can run migrations forwards (`db:migrate`) or
+  backwards (`db:rollback`), as long as you write them correctly
+
+Every migration file lives in `db/migrate/` and is named with a timestamp
+prefix plus a descriptive name:
+
+```text
+db/migrate/
+  20260322102554_create_projects.rb
+  20260322102626_create_issues.rb
+  20260322102634_create_labels.rb
+  20260322102851_add_not_null_constraints.rb
+  20260322103020_create_issue_labels.rb
+  20260323144818_add_author_name_to_issues.rb
+  20260323144942_backfill_author_name_on_issues.rb
+  20260323145039_add_not_null_to_issues_author_name.rb
+```
+
+The timestamp (e.g. `20260322102554`) is the migration **version**. Rails
+uses it to decide which migrations have run and in what order.
+
+---
+
+### 2.2 How migrations work — the lifecycle
+
+```text
+Your code                   Rails internals              Database
+────────────────────────────────────────────────────────────────────
+rails db:migrate
+  │
+  ├─ reads db/migrate/*.rb sorted by timestamp
+  │
+  ├─ checks schema_migrations table ──────────────────> SELECT version
+  │    (created automatically the first time)            FROM schema_migrations
+  │
+  ├─ runs each migration not yet in schema_migrations
+  │    calls migration.change (or .up)
+  │    wraps in a DDL transaction (unless disabled) ──> BEGIN
+  │                                                      ALTER TABLE …
+  │                                                      CREATE INDEX …
+  │                                                      COMMIT
+  │
+  └─ records the version ─────────────────────────────> INSERT INTO schema_migrations
+                                                          VALUES ('20260322102554')
+```
+
+**Key internal table — `schema_migrations`**:
+
+```sql
+SELECT * FROM schema_migrations ORDER BY version;
+-- version
+-- --------------------
+-- 20260322102554
+-- 20260322102626
+-- 20260322102634
+-- 20260322102851
+-- 20260322103020
+-- 20260323144818
+-- 20260323144942
+-- 20260323145039
+```
+
+A migration is "up" if its version is in this table; "down" if it is not.
+`rails db:rollback` removes the last version from this table and runs `down`
+(or reverses `change`).
+
+---
+
+### 2.3 When to create a migration
+
+| Situation | What to do |
+| --- | --- |
+| Adding a new table | `rails g migration CreateWidgets name:string` |
+| Adding a column to an existing table | `rails g migration AddColorToLabels color:string` |
+| Removing a column | `rails g migration RemoveColorFromLabels color:string` |
+| Adding an index | `rails g migration AddIndexToIssuesStatus` |
+| Adding a foreign key | `rails g migration AddForeignKeyIssuesToProjects` |
+| Renaming a table or column | `rails g migration RenameOldTableToNew` |
+| Changing a column type | `rails g migration ChangeStatusOnIssues` |
+| Backfilling data | Separate migration from the schema change (see 2.6) |
+
+**Convention**: migration names follow the pattern `VerbNounToTable`
+(`AddStatusToIssues`, `CreateLabels`, `RemoveArchivedFromProjects`). Rails
+uses the name to infer DSL calls when you pass column specs:
+
+```bash
+# Rails auto-generates add_column :labels, :color, :string
+rails g migration AddColorToLabels color:string
+
+# Rails auto-generates remove_column :labels, :color, :string
+rails g migration RemoveColorFromLabels color:string
+```
+
+---
+
+### 2.4 Generating migrations
 
 ```bash
 rails generate migration CreateProjects name:string description:text
@@ -70,15 +174,47 @@ rails generate migration CreateLabels name:string color:string
 rails generate migration CreateIssueLabels issue:references label:references
 ```
 
-### What `references` does automatically
+A generated file always inherits from `ActiveRecord::Migration[X.Y]` — the
+version number locks the migration to the Rails API that existed when it was
+written, so it continues to work even if the API changes in future Rails
+versions.
+
+```ruby
+class CreateProjects < ActiveRecord::Migration[8.1]
+  def change
+    create_table :projects do |t|
+      t.string :name
+      t.text   :description
+      t.timestamps
+    end
+  end
+end
+```
+
+---
+
+### 2.5 What `references` does automatically
 
 `project:references` is Rails shorthand that generates **three things** at once:
 
 1. A `project_id bigint` column
 2. A **database index** on `project_id` — critical for JOIN performance
-3. A **foreign key constraint** — referential integrity enforced at DB level
+3. A **foreign key constraint** — referential integrity enforced at the DB level
 
-### `null: false` — Defence in depth
+```ruby
+# What Rails generates:
+create_table :issues do |t|
+  t.references :project, null: false, foreign_key: true
+  # ↑ equivalent to:
+  # t.bigint :project_id, null: false
+  # add_index :issues, :project_id
+  # add_foreign_key :issues, :projects
+end
+```
+
+---
+
+### 2.6 `null: false` — Defence in depth
 
 Always enforce constraints at **both** the DB level and application level:
 
@@ -90,20 +226,220 @@ change_column_null :projects, :name, false
 validates :name, presence: true
 ```
 
-If someone bypasses the app (rake task, rails console, direct SQL), the DB constraint is your last line of defence.
+If someone bypasses the app (rake task, rails console, direct SQL), the DB
+constraint is your last line of defence.
 
-### `schema.rb` — The source of truth
+---
 
-- Auto-generated from the current DB state after each migration
-- A new developer runs `rails db:schema:load` to get the exact same DB without replaying all migrations
-- Old migrations can rot (they reference old model code); `schema.rb` never does
-- **Always commit `schema.rb` to version control**
-
-### Migration status
+### 2.7 Migration commands cheat sheet
 
 ```bash
-rails db:migrate:status   # shows up/down status for every migration
+rails db:migrate                    # run all pending migrations
+rails db:migrate VERSION=20260322   # migrate up to a specific version
+rails db:rollback                   # undo the last migration
+rails db:rollback STEP=3            # undo the last 3 migrations
+rails db:migrate:status             # show up/down status for every migration
+rails db:migrate:redo               # rollback then re-migrate the last migration
+rails db:schema:load                # load db/schema.rb directly (faster than replaying all migrations)
+rails db:reset                      # drop + create + schema:load + seed
+rails db:drop db:create db:migrate  # full cycle (preserves migration history)
 ```
+
+---
+
+### 2.8 `schema.rb` — The source of truth
+
+After every `rails db:migrate`, Rails re-generates `db/schema.rb` by
+inspecting the **live database state**. It is not a concatenation of
+migration files — it is a snapshot of what the database actually looks like
+right now.
+
+Here is the actual `schema.rb` for this project:
+
+```ruby
+# db/schema.rb (auto-generated — do not edit by hand)
+ActiveRecord::Schema[8.1].define(version: 2026_03_23_145039) do
+  enable_extension "pg_catalog.plpgsql"
+
+  create_table "issue_labels", force: :cascade do |t|
+    t.bigint   "issue_id",   null: false
+    t.bigint   "label_id",   null: false
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["issue_id"], name: "index_issue_labels_on_issue_id"
+    t.index ["label_id"], name: "index_issue_labels_on_label_id"
+  end
+
+  create_table "issues", force: :cascade do |t|
+    t.string   "title",       null: false
+    t.text     "description"
+    t.integer  "status",      null: false
+    t.bigint   "project_id",  null: false
+    t.string   "author_name", null: false
+    t.datetime "created_at",  null: false
+    t.datetime "updated_at",  null: false
+    t.index ["project_id"], name: "index_issues_on_project_id"
+  end
+
+  create_table "labels", force: :cascade do |t|
+    t.string   "name",       null: false
+    t.string   "color",      null: false
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+  end
+
+  create_table "projects", force: :cascade do |t|
+    t.string   "name",        null: false
+    t.text     "description"
+    t.datetime "created_at",  null: false
+    t.datetime "updated_at",  null: false
+  end
+
+  add_foreign_key "issue_labels", "issues"
+  add_foreign_key "issue_labels", "labels"
+  add_foreign_key "issues", "projects"
+end
+```
+
+**What it contains**:
+
+- `version:` — the timestamp of the last migration that ran
+- `enable_extension` — any PostgreSQL extensions that must exist
+- One `create_table` block per table, with columns and indexes
+- `add_foreign_key` calls at the end (always after all tables are created)
+
+**What it does NOT contain**:
+
+- The history of how you got here (that's what migration files are for)
+- Anything that was added and then removed (schema.rb shows only the final state)
+
+#### Why `schema.rb` exists
+
+| Problem with replaying migrations | How `schema.rb` solves it |
+| --- | --- |
+| Old migrations reference app models (`Issue.find_each`) that may no longer exist or have changed | `schema.rb` contains only structural DSL — no app code |
+| 200 migrations take minutes to replay | `db:schema:load` runs in seconds |
+| Migrations may contain bugs from years ago | `schema.rb` is always valid — it was written from the live DB |
+
+#### `schema.rb` vs `structure.sql`
+
+Rails supports two schema formats:
+
+| | `schema.rb` (default) | `structure.sql` |
+| --- | --- | --- |
+| **Format** | Ruby DSL | Raw SQL dump (`pg_dump`) |
+| **Portability** | Works with any AR-supported DB | Database-specific |
+| **Captures** | Tables, columns, indexes, FKs | Everything above + views, triggers, stored procedures, custom types |
+| **When to use** | Most apps | When you use PG-specific features schema.rb can't represent |
+
+Set in `config/application.rb`:
+
+```ruby
+config.active_record.schema_format = :sql  # generates db/structure.sql
+```
+
+**Rule**: use `schema.rb` unless you have views, triggers, or custom PG
+types that it cannot represent.
+
+#### Always commit `schema.rb`
+
+- It is the canonical description of your DB for new developers
+- CI and Heroku-style deploys use `db:schema:load` not `db:migrate` for
+  fresh environments
+- PRs that add migrations without updating `schema.rb` are invalid —
+  `rails db:migrate` updates it automatically, so just remember to `git add db/schema.rb`
+
+---
+
+### 2.9 Real example — the author_name migration trilogy
+
+Adding a non-nullable column to an existing table that may have live data
+requires three separate migrations (the zero-downtime pattern, covered in
+detail in Section 16):
+
+```ruby
+# Step 1 — add nullable, no default (instant, no table lock)
+class AddAuthorNameToIssues < ActiveRecord::Migration[8.1]
+  def change
+    add_column :issues, :author_name, :string
+  end
+end
+
+# Step 2 — backfill existing rows in batches (never lock the whole table)
+class BackfillAuthorNameOnIssues < ActiveRecord::Migration[8.1]
+  disable_ddl_transaction!  # lets each batch commit independently
+
+  def up
+    issue_relation = define_model("issues", :author_name, :id)
+    issue_relation.where(author_name: nil).in_batches(of: 1000) do |batch|
+      batch.update_all(author_name: "unknown")
+      sleep(0.01)
+    end
+  end
+
+  def down; end  # backfills are not reversed
+end
+
+# Step 3 — add NOT NULL constraint now that no NULLs remain
+class AddNotNullToIssuesAuthorName < ActiveRecord::Migration[8.1]
+  def up
+    change_column_null :issues, :author_name, false
+  end
+
+  def down
+    change_column_null :issues, :author_name, true
+  end
+end
+```
+
+After all three migrations run, `schema.rb` shows only the final result:
+
+```ruby
+t.string "author_name", null: false
+```
+
+The three-step history is preserved in the migration files; `schema.rb`
+captures only the destination.
+
+---
+
+### 2.10 Common interview questions
+
+**Q: What is a Rails migration and why do we use them instead of raw SQL?**
+
+> A migration is a versioned Ruby class that describes an incremental
+> database change. They are tracked in `schema_migrations`, can be run
+> forward and rolled back, and live alongside the code that depends on them
+> in Git. Raw SQL is not automatically tracked, ordered, or reversible.
+
+**Q: What is `schema.rb` and how does it differ from migration files?**
+
+> `schema.rb` is a Rails-generated snapshot of the current database
+> structure written as Ruby DSL. Migration files describe the *history* of
+> changes; `schema.rb` describes the *current state*. New environments use
+> `db:schema:load` (fast) rather than replaying all migrations (slow and
+> potentially fragile).
+
+**Q: When would you use `structure.sql` instead of `schema.rb`?**
+
+> When the application uses database features that `schema.rb`'s Ruby DSL
+> cannot express: views, triggers, stored procedures, custom PostgreSQL
+> types (e.g. enums defined at the DB level), or check constraints on
+> older Rails versions. `structure.sql` is a raw `pg_dump` output and
+> is database-specific.
+
+**Q: What does `db:reset` do vs `db:migrate`?**
+
+> `db:reset` drops the database, creates it, loads `schema.rb`, and runs
+> seeds — it gives you a clean slate. `db:migrate` only runs pending
+> migrations against an existing database. Never run `db:reset` in
+> production.
+
+**Q: Why should you never edit `schema.rb` by hand?**
+
+> `schema.rb` is auto-generated by Rails from the live database after
+> every migration. Editing it manually is overwritten the next time any
+> migration runs. Schema changes must always go through a migration.
 
 ---
 
@@ -867,4 +1203,3 @@ Issue.open.recent.with_labels
 ```
 
 ---
-

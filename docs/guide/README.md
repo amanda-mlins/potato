@@ -11,7 +11,7 @@
 
 ### [Part 1 — Rails Fundamentals](01-rails-fundamentals.md)
 
-Sections 1–12 · ~870 lines
+Sections 1–12 · ~1,200 lines
 
 | # | Topic |
 | --- | --- |
