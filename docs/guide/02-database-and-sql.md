@@ -1352,3 +1352,380 @@ end
 
 ---
 
+
+---
+
+## 21. ActiveRecord Column Types × Database Data Types
+
+Rails abstracts over the database with its own type system. When you write
+`t.string` or `t.timestamps` in a migration, ActiveRecord translates that
+into the best native type for the database you are connected to.
+Understanding the mapping lets you choose the right type up-front (avoiding
+costly migrations later) and answer confidently when interviewers probe the
+difference between, say, `datetime` and `timestamp`.
+
+---
+
+### 21.1 The full type map
+
+| AR type | PostgreSQL | SQLite | MySQL / MariaDB | Ruby class |
+|---|---|---|---|---|
+| `:primary_key` | `bigserial PRIMARY KEY` | `INTEGER PRIMARY KEY` | `BIGINT AUTO_INCREMENT PK` | `Integer` |
+| `:string` | `character varying(255)` | `varchar(255)` | `varchar(255)` | `String` |
+| `:text` | `text` | `text` | `mediumtext` | `String` |
+| `:integer` | `integer` (4 B) | `integer` | `int(11)` | `Integer` |
+| `:bigint` | `bigint` (8 B) | `integer` | `bigint(20)` | `Integer` |
+| `:float` | `float` | `float` | `float` | `Float` |
+| `:decimal` | `decimal(p,s)` | `decimal(p,s)` | `decimal(p,s)` | `BigDecimal` |
+| `:numeric` | `numeric(p,s)` | `decimal(p,s)` | `decimal(p,s)` | `BigDecimal` |
+| `:boolean` | `boolean` | `boolean` (0/1) | `tinyint(1)` | `true` / `false` |
+| `:date` | `date` | `date` | `date` | `Date` |
+| `:time` | `time without time zone` | `time` | `time` | `Time` |
+| `:datetime` | `timestamp without time zone` | `datetime` | `datetime` | `ActiveSupport::TimeWithZone` |
+| `:timestamp` | `timestamp without time zone` | `datetime` | `datetime` | `ActiveSupport::TimeWithZone` |
+| `:binary` | `bytea` | `blob` | `blob` | `String` (binary) |
+| `:json` | `json` | `text` (serialised) | `json` | `Hash` / `Array` |
+| `:jsonb` | `jsonb` (indexed binary) | *(not supported)* | *(not supported)* | `Hash` / `Array` |
+| `:uuid` | `uuid` | `varchar(36)` | `varchar(36)` | `String` |
+| `:inet` | `inet` | *(not supported)* | *(not supported)* | `IPAddr` |
+| `:hstore` | `hstore` | *(not supported)* | *(not supported)* | `Hash` |
+
+> **Rule of thumb**: AR types are database-agnostic names. Native types (`jsonb`,
+> `uuid`, `inet`) are PostgreSQL-specific and must be passed as strings
+> (`t.column :ip, :inet`) or via `enable_extension`.
+
+---
+
+### 21.2 `datetime` vs `timestamp` — the most common interview question
+
+In Rails migrations these two type names produce **identical DDL on every
+database**. They are aliases for the same AR type object.
+
+```ruby
+# Both produce the exact same column:
+t.datetime  :published_at   # → timestamp without time zone (PG)
+t.timestamp :published_at   # → timestamp without time zone (PG)
+```
+
+The distinction lives at the **PostgreSQL level**, not the Rails level:
+
+| PG type | Stores TZ? | Range | Rails keyword |
+|---|---|---|---|
+| `timestamp without time zone` | ❌ | 4713 BC – 294276 AD | `:datetime` / `:timestamp` |
+| `timestamp with time zone` (`timestamptz`) | ✅ (converts to UTC) | same | `:timestamptz` (string literal) |
+
+**What Rails actually does**: Rails normalises all times to UTC before
+writing to the database (`config.time_zone` + `ActiveRecord::Base.default_timezone = :utc`).
+Because Rails handles the time zone in application code, the column on disk
+is almost always `timestamp without time zone`. The offset is never stored
+in the column; it's stored nowhere — Rails knows it's UTC.
+
+If you need PostgreSQL to enforce UTC storage at the database level (e.g.
+multiple clients write directly), use `timestamptz` explicitly:
+
+```ruby
+# PostgreSQL-specific — not portable
+add_column :issues, :resolved_at, :timestamptz
+```
+
+**SQLite note**: SQLite has no native date/time type. Rails stores
+`datetime`/`timestamp` as ISO 8601 strings (`"2025-03-29 14:00:00.000000"`).
+This usually works fine but watch out for string comparisons in raw SQL.
+
+**MySQL note**: MySQL's `DATETIME` stores local time with no timezone awareness.
+`TIMESTAMP` stores UTC and converts on read using the server's timezone.
+This is the **opposite** of Rails' recommendation — always keep `default_timezone = :utc`
+so Rails writes UTC to a `DATETIME` column (no conversion surprises).
+
+---
+
+### 21.3 `t.timestamps` — what does it actually add?
+
+```ruby
+# In a migration:
+t.timestamps
+```
+
+Expands to exactly:
+
+```ruby
+t.datetime :created_at, null: false
+t.datetime :updated_at, null: false
+```
+
+Rails sets both automatically:
+- `created_at` — set once on `INSERT`, never touched again
+- `updated_at` — set on every `INSERT` and `UPDATE` (including `touch`)
+
+Both become `timestamp without time zone NOT NULL` in PostgreSQL.
+
+In our project's `CreateProjects` migration:
+
+```ruby
+create_table :projects do |t|
+  t.string :name        # → varchar(255)
+  t.text   :description # → text (unlimited length)
+  t.timestamps          # → created_at + updated_at (timestamp NOT NULL)
+end
+```
+
+---
+
+### 21.4 `string` vs `text`
+
+| | `:string` | `:text` |
+|---|---|---|
+| **PostgreSQL** | `varchar(255)` (default limit) | `text` (unlimited) |
+| **SQLite** | `varchar(255)` | `text` |
+| **MySQL** | `varchar(255)` | `mediumtext` (≤ 16 MB) |
+| **Indexed?** | Fully indexable | PG: indexable; MySQL: prefix index only |
+| **Validation** | AR enforces `length` if you add it | AR enforces `length` if you add it |
+| **When to use** | Short, bounded values — names, slugs, titles | Long, unbounded prose — descriptions, bodies |
+
+You can override the limit on `:string`:
+
+```ruby
+t.string :title,  limit: 500   # → varchar(500) on PG / MySQL
+t.string :status, limit: 20    # fine for an enum-like column
+```
+
+In our `CreateIssues` migration:
+
+```ruby
+t.string :title          # varchar(255) — good: titles are short
+t.text   :description    # text — good: descriptions can be long
+t.integer :status        # stores the enum ordinal (0, 1, 2 …)
+```
+
+---
+
+### 21.5 `integer` vs `bigint`
+
+| | `:integer` | `:bigint` |
+|---|---|---|
+| **Size** | 4 bytes | 8 bytes |
+| **Range** | −2,147,483,648 → 2,147,483,647 | −9.2 × 10¹⁸ → 9.2 × 10¹⁸ |
+| **PG type** | `integer` | `bigint` |
+| **Default PK** | `:primary_key` → `bigserial` (bigint) since Rails 5.1 | same |
+
+Since Rails 5.1, `create_table` generates `bigserial` primary keys by default.
+Foreign keys created with `t.references` are also `bigint` to match.
+
+```ruby
+# In CreateIssues — Rails generates a bigint id:
+create_table :issues do |t|
+  # implicit: id bigserial PRIMARY KEY
+  t.references :project, null: false, foreign_key: true
+  # → project_id bigint NOT NULL REFERENCES projects(id)
+end
+```
+
+Use `:integer` only for columns that will never exceed ~2 billion values
+(e.g. enum ordinals, small counters). Prefer `:bigint` for anything that
+grows.
+
+---
+
+### 21.6 `float` vs `decimal` / `numeric`
+
+| | `:float` | `:decimal` / `:numeric` |
+|---|---|---|
+| **PG type** | `double precision` (IEEE 754, 8 B) | `decimal(p, s)` (exact) |
+| **Precision** | ~15–17 significant digits, **inexact** | Exact to `p` digits, `s` after decimal |
+| **Ruby class** | `Float` | `BigDecimal` |
+| **Use for** | Scientific values, ML scores, approximations | Money, rates, measurements requiring exactness |
+
+```ruby
+# Wrong — floating-point errors accumulate:
+t.float :price
+
+# Correct — exact arithmetic:
+t.decimal :price, precision: 10, scale: 2  # → decimal(10,2) on PG
+```
+
+Rule: **never use `:float` for money**. Use `:decimal` with `precision` and
+`scale`, or store the value in cents as an `:integer`.
+
+---
+
+### 21.7 `:boolean`
+
+| Database | Column type | True stored as | False stored as |
+|---|---|---|---|
+| PostgreSQL | `boolean` | `true` | `false` |
+| SQLite | `boolean` (affinity) | `1` | `0` |
+| MySQL | `tinyint(1)` | `1` | `0` |
+
+ActiveRecord normalises all three to Ruby `true` / `false`.
+
+**Gotcha — PostgreSQL**:
+
+```sql
+-- This is VALID in PG:
+SELECT * FROM issues WHERE archived = true;
+-- This is NOT VALID:
+SELECT * FROM issues WHERE archived = 1;  -- PG rejects it
+```
+
+**Gotcha — SQLite in tests**: because SQLite stores booleans as integers,
+queries like `WHERE archived = 'true'` will silently return no rows. Always
+compare against the boolean, not a string.
+
+---
+
+### 21.8 `:json` vs `:jsonb` (PostgreSQL)
+
+| | `:json` | `:jsonb` |
+|---|---|---|
+| **Storage** | Text (exact copy) | Binary (parsed, re-serialised) |
+| **Indexable** | ❌ (only full-column) | ✅ GIN index on keys/values |
+| **Operators** | `->`, `->>` | `->`, `->>`, `@>`, `?`, `?|`, `?&` |
+| **Size** | Slightly smaller | Slightly larger |
+| **Speed** | Slower queries | Faster queries |
+| **Preserve key order** | ✅ | ❌ |
+
+```ruby
+# SQLite / MySQL: falls back to serialised text — no query operators
+add_column :issues, :metadata, :jsonb, default: {}
+
+# Query in Rails:
+Issue.where("metadata @> ?", { source: "api" }.to_json)
+```
+
+Use `:json` only when you need to preserve insertion order or exact
+whitespace. In all other cases, use `:jsonb`.
+
+---
+
+### 21.9 `:uuid` as primary key
+
+PostgreSQL ships with the `pgcrypto` extension which generates UUID v4:
+
+```ruby
+# Migration:
+enable_extension "pgcrypto"
+
+create_table :api_tokens, id: :uuid do |t|
+  t.references :project, type: :uuid, foreign_key: true, null: false
+  t.string :name, null: false
+  t.timestamps
+end
+```
+
+```ruby
+# config/initializers/generators.rb
+Rails.application.config.generators do |g|
+  g.orm :active_record, primary_key_type: :uuid
+end
+```
+
+Tradeoffs:
+
+| | Auto-increment bigint | UUID |
+|---|---|---|
+| **Predictability** | Sequential — easy to guess | Random — hard to enumerate |
+| **Index locality** | B-tree stays sorted → fast inserts | Random → index bloat, page splits |
+| **Distributed ID** | Needs coordination | Self-generating per node |
+| **Readability in URLs** | `/issues/42` | `/issues/550e8400-…` |
+
+In our project we use default `bigserial` PKs — fine for a single-node app.
+UUID makes more sense for distributed systems or when you don't want to
+expose record counts via URL.
+
+---
+
+### 21.10 How to inspect what Rails really generates
+
+```bash
+# See the actual SQL Rails will run:
+bundle exec rails db:migrate:status
+
+# Check the column types Rails sees after migration:
+bundle exec rails db      # opens psql (PG) or sqlite3
+```
+
+In psql:
+```sql
+-- Describe the issues table:
+\d issues
+
+-- Output (abbreviated):
+--  Column      | Type                        | Nullable
+-- -------------+-----------------------------+---------
+--  id          | bigint                      | not null
+--  title       | character varying(255)      | not null
+--  description | text                        |
+--  status      | integer                     | not null
+--  project_id  | bigint                      | not null
+--  created_at  | timestamp without time zone | not null
+--  updated_at  | timestamp without time zone | not null
+```
+
+From Rails console:
+```ruby
+# Inspect column metadata at runtime:
+Issue.columns.map { |c| [c.name, c.type, c.sql_type] }
+# => [["id", :integer, "bigint"],
+#     ["title", :string, "character varying(255)"],
+#     ["description", :text, "text"],
+#     ["status", :integer, "integer"],
+#     ["project_id", :integer, "bigint"],
+#     ["created_at", :datetime, "timestamp without time zone"],
+#     ["updated_at", :datetime, "timestamp without time zone"]]
+
+# Check one column:
+Issue.column_for_attribute(:created_at).sql_type
+# => "timestamp without time zone"
+```
+
+---
+
+### 21.11 Common interview questions
+
+**Q: What is the difference between `datetime` and `timestamp` in Rails?**
+
+> In Rails migrations they are **identical** — both produce
+> `timestamp without time zone` in PostgreSQL. The distinction is at the
+> PostgreSQL level: `timestamp` vs `timestamptz` (with timezone). Rails always
+> stores UTC and normalises timezone in application code, so you rarely need
+> `timestamptz` unless non-Rails clients write directly to the DB.
+
+**Q: Why does `t.timestamps` use `datetime` and not `timestamp`?**
+
+> Historically, `timestamp` in MySQL had a range limit (1970–2038) and
+> auto-update behaviour that Rails didn't want. Using `:datetime` (which maps
+> to MySQL `DATETIME`, PostgreSQL `timestamp without time zone`) gives uniform
+> semantics across databases. Rails manages UTC conversion itself.
+
+**Q: Should I use `:float` or `:decimal` for a price column?**
+
+> Always `:decimal` with explicit `precision` and `scale`. `float` (IEEE 754)
+> cannot represent most decimal fractions exactly — `0.1 + 0.2 != 0.3` in
+> floating-point arithmetic. Money arithmetic requires exactness;
+> `BigDecimal` (backed by `decimal(p,s)`) provides it.
+
+**Q: What does `t.references :project` generate?**
+
+> It adds a `project_id bigint NOT NULL` column plus (optionally) an index
+> and a foreign key constraint. With `null: false, foreign_key: true` it also
+> adds `REFERENCES projects(id)` at the DB level. The column is `bigint`
+> because primary keys default to `bigserial` since Rails 5.1.
+
+**Q: How do I store free-form metadata in a PostgreSQL-backed Rails app?**
+
+> Use `:jsonb` — it is stored as parsed binary (faster queries), supports
+> GIN indexes for key/value lookup, and provides rich operators (`@>`, `?`).
+> Use `:json` only if you need to preserve insertion order.
+
+**Q: Why might a boolean query work in development (SQLite) but fail in production (PostgreSQL)?**
+
+> SQLite stores booleans as integers (`0`/`1`) and accepts string
+> comparisons. PostgreSQL enforces strict boolean semantics — querying
+> `WHERE active = 1` or `WHERE active = 'true'` raises a type error. Always
+> use `true`/`false` literals or AR's query interface to stay portable.
+
+---
+
+#### Next up: Testing with RSpec / Minitest (Section 22)
+
+---

@@ -32,7 +32,7 @@ Sections 1–12 · ~870 lines
 
 ### [Part 2 — Database & SQL](02-database-and-sql.md)
 
-Sections 13–20 · ~1,350 lines
+Sections 13–21 · ~1,700 lines
 
 | # | Topic |
 | --- | --- |
@@ -44,6 +44,7 @@ Sections 13–20 · ~1,350 lines
 | 18 | PostgreSQL Deep Dive |
 | 19 | Foreign Keys, Database Locks & Constraint Patterns |
 | 20 | Migration Methods — `change` vs `up`/`down` |
+| 21 | ActiveRecord Column Types × Database Data Types |
 
 ---
 
@@ -98,6 +99,7 @@ Sections 25–26, + Pagination · ~1,300 lines
 | Zero-downtime migrations | [Part 2](02-database-and-sql.md) |
 | PostgreSQL — indexes, JSONB, CTEs | [Part 2](02-database-and-sql.md) |
 | Database locks & foreign keys | [Part 2](02-database-and-sql.md) |
+| AR types × DB types (datetime, decimal, jsonb…) | [Part 2](02-database-and-sql.md) |
 | RSpec setup & GitLab testing style | [Part 3](03-testing.md) |
 | FactoryBot & shared examples | [Part 3](03-testing.md) |
 | Capybara drivers (rack_test, Selenium, Cuprite) | [Part 3](03-testing.md) |
