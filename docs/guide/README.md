@@ -50,13 +50,15 @@ Sections 13–21 · ~1,700 lines
 
 ### [Part 3 — Testing](03-testing.md)
 
-Sections 21, 27–28 · ~1,380 lines
+Sections 21, 27–30 · ~1,900 lines
 
 | # | Topic |
 | --- | --- |
 | 21 | Testing with RSpec — The GitLab Way |
 | 27 | Capybara & System Tests — Drivers, DSL, and Best Practices |
 | 28 | The Testing Pyramid — Types of Tests in Rails & How GitLab Does It |
+| 29 | Test Coverage — SimpleCov & the GitLab Approach |
+| 30 | Monitoring — Prometheus, Grafana, Sentry & the Observability Stack |
 
 ---
 
@@ -105,6 +107,8 @@ Sections 25–26, + Pagination · ~1,300 lines
 | Capybara drivers (rack_test, Selenium, Cuprite) | [Part 3](03-testing.md) |
 | System tests & database cleaner | [Part 3](03-testing.md) |
 | Testing pyramid & spec types | [Part 3](03-testing.md) |
+| Test coverage — SimpleCov, line vs branch, diff coverage | [Part 3](03-testing.md) |
+| Monitoring — Prometheus, Grafana, Sentry, tracing | [Part 3](03-testing.md) |
 | Ruby truthiness, identity, gotchas | [Part 4](04-ruby-and-api.md) |
 | JSON API with Jbuilder | [Part 4](04-ruby-and-api.md) |
 | Fat model vs service objects | [Part 5](05-architecture.md) |

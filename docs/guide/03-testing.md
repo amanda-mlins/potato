@@ -1381,3 +1381,502 @@ The inverted testing pyramid. A codebase with mostly E2E/feature tests and few u
 
 **Q: What is the `build` vs `create` distinction in FactoryBot and why does it matter for test speed?**
 `create` persists the record to the database (INSERT). `build` instantiates the Ruby object without hitting the database. For unit tests that only need the object in memory (validations, method logic), `build` is correct — it avoids a DB round-trip and makes the test 10–50× faster. Using `create` everywhere is the most common cause of slow model spec suites.
+
+---
+
+## 29. Test Coverage — SimpleCov & the GitLab Approach
+
+### What is test coverage?
+
+**Test coverage** measures what percentage of your application code is
+executed when the test suite runs. It is expressed as a ratio of
+**lines hit** (or branches hit) to **total lines**.
+
+Coverage is a **floor, not a ceiling** — 100% coverage does not mean
+your tests are good, it only means every line was executed at least once.
+But low coverage (< 80%) is a reliable signal that large swaths of code
+are completely untested.
+
+---
+
+### SimpleCov — the standard Ruby coverage tool
+
+**SimpleCov** wraps Ruby's built-in `Coverage` module with a friendly
+DSL, HTML report generation, and per-group breakdowns.
+
+#### Installation
+
+```ruby
+# Gemfile
+group :test do
+  gem "simplecov", require: false
+end
+```
+
+#### Wiring it into spec_helper.rb
+
+SimpleCov **must be started before Rails or any application code loads** —
+otherwise files loaded before `SimpleCov.start` will not appear in the
+report.
+
+```ruby
+# spec/spec_helper.rb — very first lines, before everything else
+require "simplecov"
+
+SimpleCov.start "rails" do
+  # Fail the build if coverage drops below this threshold
+  minimum_coverage 90
+
+  # Exclude files that don't need coverage
+  add_filter "/spec/"
+  add_filter "/config/"
+  add_filter "/db/"
+  add_filter "/vendor/"
+
+  # Group the report by layer
+  add_group "Models",      "app/models"
+  add_group "Controllers", "app/controllers"
+  add_group "Helpers",     "app/helpers"
+  add_group "Jobs",        "app/jobs"
+  add_group "Mailers",     "app/mailers"
+end
+
+# ... rest of spec_helper.rb
+```
+
+The `"rails"` preset automatically excludes common noise (rake tasks,
+initializers, db/migrate, etc.).
+
+After running `bundle exec rspec`, SimpleCov writes:
+
+```
+coverage/index.html   ← open in browser for the full visual report
+```
+
+And prints to the terminal:
+
+```
+Coverage report generated for RSpec to /path/to/coverage/index.html.
+73 / 80 LOC (91.25%) covered.
+```
+
+---
+
+### How GitLab uses SimpleCov
+
+GitLab configures SimpleCov with a regex that GitLab CI recognises to
+populate the **coverage badge** and the **diff coverage panel** on merge
+requests:
+
+```yaml
+# .gitlab-ci.yml
+rspec:
+  script:
+    - bundle exec rspec
+  coverage: '/LOC \((\d+\.\d+%)\) covered/'
+```
+
+The pipeline then shows:
+- **Total coverage** on the pipeline page
+- **Diff coverage** — only the lines added/changed in the MR — so reviewers
+  can see at a glance whether new code is covered without looking at total
+  coverage (which barely moves on a large codebase)
+
+GitLab's target is **> 90% overall coverage** across the monorepo.
+
+---
+
+### Branch coverage vs line coverage
+
+By default SimpleCov counts **line coverage** — was this line executed?
+You can enable **branch coverage** (was each conditional path taken?):
+
+```ruby
+SimpleCov.start "rails" do
+  enable_coverage :branch
+  primary_coverage :branch  # fail threshold applies to branch %, not line %
+  minimum_coverage line: 90, branch: 80
+end
+```
+
+Branch coverage catches bugs that line coverage misses:
+
+```ruby
+def discount(user)
+  return 0.2 if user.premium?  # ← line is hit, but what if premium? is false?
+  0.0
+end
+
+# Line coverage: 100% if any test calls discount()
+# Branch coverage: requires one test where user.premium? is true
+#                  AND one where it is false
+```
+
+---
+
+### Test quality tools GitLab uses beyond SimpleCov
+
+| Tool | Purpose |
+| --- | --- |
+| **Knapsack Pro** | Splits the suite across parallel CI nodes by historical timing — reduces hours-long runs to ~15 min |
+| **rspec-retry** | Retries flaky specs N times before failing — buys time to fix intermittent failures without blocking CI |
+| **test-prof** | Profiles slow specs — identifies which factories, `let` chains, or DB calls are the bottleneck |
+| **Crystalball** | Predictive test selection — maps changed files to affected specs; MR pipelines run only relevant tests |
+| **Mutation testing** | Verifies tests actually catch bugs by mutating source code and checking if tests fail — run selectively on critical paths |
+
+**test-prof** example — finding the slowest factories:
+
+```bash
+TEST_STACK_PROF=1 bundle exec rspec
+# Prints a flamegraph showing where time is spent during the test run
+```
+
+---
+
+### Adding SimpleCov to this project
+
+```ruby
+# Gemfile
+group :test do
+  gem "simplecov", require: false
+end
+```
+
+```ruby
+# spec/spec_helper.rb — insert at the very top, before RSpec.configure
+require "simplecov"
+
+SimpleCov.start "rails" do
+  minimum_coverage 90
+  add_filter "/spec/"
+  add_filter "/config/"
+  add_filter "/db/"
+  add_group "Models",      "app/models"
+  add_group "Controllers", "app/controllers"
+  add_group "Jobs",        "app/jobs"
+end
+```
+
+```bash
+bundle install
+bundle exec rspec
+open coverage/index.html  # macOS
+```
+
+---
+
+### Coverage — Interview Q&A
+
+**Q: What is test coverage and what are its limits?**
+
+> Coverage measures what percentage of code lines (or branches) are
+> executed during the test run. Its limit: 100% coverage does not mean
+> 100% correctness — a test that calls every line but makes no assertions
+> has full coverage and zero value. Coverage is a useful floor (low
+> coverage is bad) but a poor ceiling (high coverage is not a quality
+> guarantee).
+
+**Q: Why must SimpleCov be started before Rails loads?**
+
+> Ruby's `Coverage` module only tracks files that are loaded *after*
+> coverage tracking starts. If Rails and the application boot before
+> `SimpleCov.start`, those files are never registered and will not appear
+> in the report — giving a falsely optimistic coverage number.
+
+**Q: What is diff coverage and why does GitLab use it on MRs?**
+
+> Diff coverage shows coverage only for the lines added or changed in a
+> merge request, ignoring the rest of the codebase. On a large repo the
+> total coverage percentage barely moves when you add 50 lines — diff
+> coverage makes the signal meaningful: "did the author cover their own
+> changes?"
+
+**Q: What is the difference between line coverage and branch coverage?**
+
+> Line coverage records whether a line was executed at all. Branch
+> coverage records whether each conditional path (both sides of an `if`,
+> every `case` branch) was taken. Branch coverage catches untested logical
+> paths that line coverage misses — a line with `if x; A; else; B; end`
+> can be 100% line-covered if a test hits it, but 50% branch-covered if
+> only one side is ever exercised.
+
+**Q: What is Crystalball and how does it speed up GitLab's CI?**
+
+> Crystalball builds a map of which spec files cover which application
+> files by recording which files are loaded during each spec. On a new
+> MR, it runs only the specs that cover the changed files, skipping the
+> rest. For a 50,000-spec suite this can reduce a 60-minute run to a
+> 5-minute targeted run on the MR pipeline, while the full suite still
+> runs nightly.
+
+---
+
+## 30. Monitoring — Prometheus, Grafana, Sentry & the Observability Stack
+
+### The three pillars of observability
+
+A production system is observable if you can answer three questions from
+external data alone:
+
+| Pillar | Question answered | Tool |
+| --- | --- | --- |
+| **Metrics** | *What is happening right now, in numbers?* | Prometheus + Grafana |
+| **Logs** | *What happened, in detail, for this request?* | ELK / Fluentd |
+| **Traces** | *Why was this specific request slow?* | Jaeger / OpenTelemetry |
+
+GitLab uses all three, and they are designed to complement each other:
+metrics alert you that something is wrong, logs tell you what happened,
+traces tell you where the time was spent.
+
+---
+
+### Metrics — Prometheus & Grafana
+
+**Prometheus** scrapes metrics from every service on a regular interval
+(typically 15 s) and stores them as time-series. Rails exposes metrics via
+the `prometheus-client` gem through a `/metrics` Rack endpoint.
+
+#### What GitLab exposes
+
+```text
+# Counters — monotonically increasing
+gitlab_rails_requests_total{controller, action, format, status}
+gitlab_rails_exceptions_total{exception_class}
+sidekiq_jobs_processed_total{queue, worker}
+sidekiq_jobs_failed_total{queue, worker}
+
+# Histograms — latency distributions with buckets
+gitlab_rails_sql_duration_seconds{bucket}
+gitlab_rails_redis_client_duration_seconds{bucket}
+gitlab_rails_cache_operation_duration_seconds{command, bucket}
+gitlab_rails_request_duration_seconds{controller, action, bucket}
+
+# Gauges — point-in-time values
+gitlab_rails_active_connections
+sidekiq_queue_size{queue}
+sidekiq_queue_latency_seconds{queue}
+```
+
+#### Grafana dashboards
+
+Grafana queries Prometheus with **PromQL** to build dashboards:
+
+```promql
+# p99 request latency for the last 5 minutes
+histogram_quantile(0.99,
+  rate(gitlab_rails_request_duration_seconds_bucket[5m])
+)
+
+# Error rate per second
+rate(gitlab_rails_exceptions_total[1m])
+
+# Sidekiq throughput — jobs per second
+rate(sidekiq_jobs_processed_total[1m])
+```
+
+---
+
+### The RED method — what GitLab tracks per service
+
+The **RED method** (from Tom Wilkie at Weaveworks) defines the three
+metrics every service should expose:
+
+| Letter | Metric | What it means |
+| --- | --- | --- |
+| **R** | Rate | Requests per second |
+| **E** | Errors | Failed requests per second (or %) |
+| **D** | Duration | Latency distribution (p50, p95, p99) |
+
+GitLab tracks these for every Rails controller action, every Sidekiq
+worker, every Gitaly RPC call, and every Redis/database operation.
+
+---
+
+### SLOs — what GitLab commits to
+
+| Metric | Target |
+| --- | --- |
+| Web p99 latency | < 1 s for most endpoints |
+| API p99 latency | < 300 ms |
+| Sidekiq job pick-up latency (critical queue) | < 10 s |
+| Error rate | < 0.1% of requests |
+| Availability | 99.95% (GitLab.com) |
+
+When an SLO is breached, **Prometheus AlertManager** fires an alert to
+**PagerDuty**, which pages the on-call engineer.
+
+---
+
+### Error tracking — Sentry
+
+**Sentry** captures unhandled exceptions with full stack traces, request
+context, user ID, and breadcrumbs. GitLab runs a self-hosted Sentry
+instance.
+
+```ruby
+# Gemfile
+gem "sentry-ruby"
+gem "sentry-rails"
+gem "sentry-sidekiq"
+
+# config/initializers/sentry.rb
+Sentry.init do |config|
+  config.dsn                    = ENV["SENTRY_DSN"]
+  config.breadcrumbs_logger     = [:active_support_logger, :http_logger]
+  config.traces_sample_rate     = 0.1   # send 10% of transactions as traces
+  config.profiles_sample_rate   = 0.1
+  config.environment            = Rails.env
+  config.release                = ENV["GIT_COMMIT_SHA"]
+end
+```
+
+Sentry integrates with Sidekiq automatically — failed jobs appear with
+their full context. It also supports **performance monitoring** (Sentry
+Transactions), which overlap with Jaeger for tracing.
+
+---
+
+### Distributed tracing — Jaeger / OpenTelemetry
+
+A single GitLab web request may touch: Rails → Redis → PostgreSQL →
+Gitaly (Git operations) → Workhorse (file serving) → Registry. A trace
+records a **span** for each hop, with timing and metadata.
+
+```
+Request: GET /project/repo/issues
+│
+├─ Rails router + middleware          2 ms
+├─ ApplicationController#before_action  1 ms
+├─ IssuesController#index
+│   ├─ DB: SELECT issues WHERE ...   12 ms  ← slow
+│   ├─ Redis: cache GET              0.4 ms
+│   └─ View render                    8 ms
+└─ Total                             24 ms
+```
+
+GitLab uses **OpenTelemetry** as the instrumentation standard (vendor-
+neutral) and exports to Jaeger for storage and querying.
+
+---
+
+### Logging — structured JSON
+
+Every Rails log line at GitLab is a **JSON object**, not a plain string:
+
+```json
+{
+  "severity": "INFO",
+  "time": "2026-03-30T14:00:00.000Z",
+  "correlation_id": "abc123",
+  "method": "GET",
+  "path": "/api/v4/projects/1/issues",
+  "status": 200,
+  "duration_s": 0.045,
+  "db_duration_s": 0.012,
+  "redis_calls": 3,
+  "user_id": 42,
+  "project_id": 1
+}
+```
+
+Structured logs can be queried, aggregated, and alerted on in
+Elasticsearch. Plain-string logs cannot.
+
+Rails produces plain-string logs by default. GitLab uses the
+`lograge` gem to convert them:
+
+```ruby
+# Gemfile
+gem "lograge"
+
+# config/initializers/lograge.rb
+Rails.application.configure do
+  config.lograge.enabled = true
+  config.lograge.formatter = Lograge::Formatters::Json.new
+  config.lograge.custom_options = lambda do |event|
+    {
+      user_id:    event.payload[:user_id],
+      request_id: event.payload[:request_id]
+    }
+  end
+end
+```
+
+---
+
+### The full GitLab monitoring stack
+
+| Layer | Tool | Hosted how |
+| --- | --- | --- |
+| Metrics collection | Prometheus | Self-managed |
+| Metrics visualisation | Grafana | Self-managed |
+| Alerting | Prometheus AlertManager + PagerDuty | Managed |
+| Error tracking | Sentry | Self-hosted |
+| Distributed tracing | Jaeger + OpenTelemetry | Self-managed |
+| Log shipping | Fluentd → Elasticsearch | Self-managed |
+| Log querying | Kibana | Self-managed |
+| Uptime / synthetic checks | Pingdom + internal probes | Managed |
+
+---
+
+### What this means for a Rails interview
+
+When asked about monitoring in Rails, interviewers want to hear:
+
+1. **The three pillars** — metrics (what), logs (what in detail), traces (why)
+2. **The RED method** — rate, errors, duration — for services
+3. **The USE method** — utilisation, saturation, errors — for infrastructure
+4. **Actionability** — an alert without a runbook is noise; every metric should drive a decision
+
+A minimal production Rails app needs at minimum:
+- **Exception tracking** (Sentry or Honeybadger) — zero config, huge value
+- **Request latency & error rate** (Skylight, Scout, or self-hosted Prometheus) 
+- **Background job monitoring** (Sidekiq Web UI or Solid Queue dashboard)
+- **Structured logs** (lograge) so log lines are searchable
+
+---
+
+### Monitoring — Interview Q&A
+
+**Q: What are the three pillars of observability?**
+
+> Metrics (what is happening, in numbers — Prometheus), logs (what
+> happened for a specific request — ELK/Fluentd), and traces (why a
+> specific request was slow across service boundaries — Jaeger/
+> OpenTelemetry). Metrics alert you, logs explain what happened, traces
+> show where time was spent.
+
+**Q: What is the RED method?**
+
+> Rate (requests per second), Errors (failed requests per second), Duration
+> (latency distribution). It defines the three metrics every service should
+> expose. GitLab tracks RED for every Rails controller action, Sidekiq
+> worker, and downstream RPC call.
+
+**Q: What does Sentry give you that logs don't?**
+
+> Sentry groups identical exceptions together, tracks occurrence count and
+> affected users, captures the full stack trace with local variable values,
+> shows breadcrumbs leading up to the error, and alerts when a new
+> exception class appears. Logs require you to search for errors
+> reactively; Sentry surfaces them proactively.
+
+**Q: Why use structured (JSON) logs instead of plain-string logs?**
+
+> Structured logs are machine-readable — you can query `duration_s > 1.0`
+> in Kibana, aggregate by `user_id`, or alert when `status: 500` exceeds a
+> threshold. Plain-string logs require fragile regex parsing and can't be
+> aggregated. GitLab uses `lograge` to convert Rails' default log format
+> to JSON and ships every field (user ID, correlation ID, DB/Redis
+> duration) as a queryable attribute.
+
+**Q: What is a distributed trace and when do you need one?**
+
+> A trace records the end-to-end journey of a single request through all
+> the services it touches, with a timing span for each hop. You need
+> distributed tracing when a request is slow but the bottleneck is not
+> obvious from the Rails log alone — it might be a slow Gitaly RPC, a
+> Redis call on a cold key, or an N+1 hidden inside a serialiser. A trace
+> makes the breakdown visible in one view.
+
+---
