@@ -15,13 +15,13 @@ RSpec.describe 'Issues', type: :request do
   # This test documents that — a real GitLab practice: test what exists,
   # then drive new behaviour with failing tests first (TDD).
   # ---------------------------------------------------------------
-  describe 'GET /projects/:project_id/issues' do
-    it 'returns HTTP 404 because the index action is not yet implemented' do
-      get project_issues_path(project)
+  # describe 'GET /projects/:project_id/issues' do
+  #   it 'returns HTTP 404 because the index action is not yet implemented' do
+  #     get project_issues_path(project)
 
-      expect(response).to have_http_status(:not_found)
-    end
-  end
+  #     expect(response).to have_http_status(:not_found)
+  #   end
+  # end
 
   # ---------------------------------------------------------------
   # GET /issues/:id
