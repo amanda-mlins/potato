@@ -1211,7 +1211,7 @@ end
 
 Pagination sits in the controller — it is an HTTP/presentation concern, not a domain concern:
 
-```
+```text
 Controller     → pagy(@scope)          decides page size, reads params[:page]
 Model scope    → .with_labels.recent   owns ordering + eager-loading
 Jbuilder view  → json.pagination       owns JSON representation
@@ -1241,3 +1241,731 @@ When the collection can be very large (millions of rows), when the UI uses infin
 
 **Q: Why is Pagy preferred over Kaminari in modern Rails apps?**
 Pagy is a plain Ruby object — it does not extend ActiveRecord models with scopes or add instance methods. It is roughly 40× faster and uses significantly less memory because it does not load or decorate AR objects for pagination purposes. It supports both offset and keyset strategies, provides a JSON metadata helper out of the box, and is what GitLab itself uses.
+
+---
+
+## 28. Concurrency in Rails — Threads, Processes, Locks & Race Conditions
+
+### 28.1 The Rails concurrency model — Puma
+
+Rails ships with **Puma** as its default web server. Puma uses a
+**multi-threaded, multi-process** model:
+
+```text
+┌─────────────────── OS process (Puma worker) ───────────────────┐
+│                                                                  │
+│  Thread 1 ──► handles request A (waiting on DB query)           │
+│  Thread 2 ──► handles request B (rendering view)                │
+│  Thread 3 ──► handles request C (writing to Redis)              │
+│  Thread 4 ──► idle                                              │
+│  Thread 5 ──► idle                                              │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+         ×  (number of workers / WEB_CONCURRENCY)
+```
+
+**Threads** within one process share memory — fast, low overhead, but
+require thread-safe code. **Workers** (processes) are copies of the entire
+app — isolated memory, more RAM, but simpler safety guarantees.
+
+The defaults in `config/puma.rb`:
+
+```ruby
+# config/puma.rb
+threads_count = ENV.fetch("RAILS_MAX_THREADS", 5).to_i
+threads threads_count, threads_count   # min, max threads per worker
+
+workers ENV.fetch("WEB_CONCURRENCY", 2).to_i  # processes (cluster mode)
+
+preload_app!   # fork after loading the app — saves RAM via copy-on-write
+```
+
+**Rule of thumb**: Set `RAILS_MAX_THREADS` equal to your database
+connection pool size (they are coupled — each thread needs its own
+connection). Set `WEB_CONCURRENCY` based on available RAM:
+roughly `RAM / per-process-RAM`.
+
+---
+
+### 28.2 Thread safety in Rails
+
+Rails itself is thread-safe as of Rails 4. The critical rule:
+
+> **Never store mutable state in global or class-level variables.**
+
+```ruby
+# UNSAFE — all threads share @@count
+class IssuesController < ApplicationController
+  @@count = 0
+  def index
+    @@count += 1   # race condition: read-increment-write is not atomic
+  end
+end
+
+# SAFE — instance variables are per-request (each request is one object)
+class IssuesController < ApplicationController
+  def index
+    @count = Issue.count   # local to this request's controller instance
+  end
+end
+```
+
+| Storage | Thread-safe? | Scope |
+| --- | --- | --- |
+| Instance variables (`@var`) | ✅ | Per request (controller instance) |
+| Local variables | ✅ | Per method call |
+| `Thread.current[:key]` | ✅ | Per thread |
+| Class variables (`@@var`) | ❌ | Shared across all threads |
+| Constants mutated at runtime | ❌ | Shared across all threads |
+| `Rails.cache` | ✅ | Thread-safe by design |
+
+**`Thread.current`** is a safe way to pass per-request data (e.g. current
+user) across layers without passing it as a method argument:
+
+```ruby
+# In ApplicationController:
+before_action { Thread.current[:current_user] = current_user }
+after_action  { Thread.current[:current_user] = nil }  # always clean up
+
+# In a service object or model:
+user = Thread.current[:current_user]
+```
+
+---
+
+### 28.3 The database connection pool
+
+Each Puma thread needs its own database connection. ActiveRecord manages a
+**connection pool** — a fixed set of persistent connections shared across
+threads within one process.
+
+```yaml
+# config/database.yml
+production:
+  pool: <%= ENV.fetch("RAILS_MAX_THREADS", 5) %>
+```
+
+**Pool size must equal `RAILS_MAX_THREADS`**. If it's smaller, threads
+block waiting for a free connection — you get `ActiveRecord::ConnectionTimeoutError`.
+If it's larger, you waste DB server resources.
+
+```ruby
+# Check pool status from console:
+ActiveRecord::Base.connection_pool.stat
+# => { size: 5, connections: 3, busy: 2, dead: 0, idle: 1, waiting: 0, checkout_timeout: 5.0 }
+```
+
+When running background jobs alongside Puma (e.g. Solid Queue in the same
+process), both compete for the same pool — size it accordingly.
+
+---
+
+### 28.4 Race conditions — the classic example
+
+Two users simultaneously close the same issue:
+
+```text
+Thread A                          Thread B
+────────                          ────────
+issue = Issue.find(1)             issue = Issue.find(1)
+  # status: :open                   # status: :open
+issue.update!(status: :closed)
+                                  issue.update!(status: :closed)
+                                  # no error — double-write, data looks fine
+                                  # but callbacks / side-effects ran twice
+```
+
+If "closing an issue" triggers a notification job, the notification fires
+twice. Rails gives you two tools to prevent this.
+
+---
+
+### 28.5 Optimistic locking — for low-contention conflicts
+
+**Optimistic locking** assumes conflicts are rare. It lets concurrent reads
+proceed freely but detects a conflict at write time by comparing a version
+counter.
+
+**Setup**: add a `lock_version` integer column (Rails detects it
+automatically):
+
+```ruby
+# Migration
+add_column :issues, :lock_version, :integer, default: 0, null: false
+```
+
+```ruby
+# No code change needed in the model — AR handles it automatically
+issue_a = Issue.find(1)  # lock_version: 5
+issue_b = Issue.find(1)  # lock_version: 5
+
+issue_a.update!(status: :closed)  # UPDATE ... SET lock_version = 6 WHERE lock_version = 5
+# ✅ succeeds — lock_version in DB was 5
+
+issue_b.update!(status: :closed)  # UPDATE ... SET lock_version = 6 WHERE lock_version = 5
+# ❌ raises ActiveRecord::StaleObjectError — lock_version in DB is now 6
+```
+
+Handle the conflict in the controller:
+
+```ruby
+def update
+  @issue.update!(issue_params)
+rescue ActiveRecord::StaleObjectError
+  @issue.reload
+  flash.now[:alert] = "This issue was modified by someone else. Please review and retry."
+  render :edit, status: :conflict
+end
+```
+
+**When to use**: edit forms, APIs where clients fetch-then-update, any
+multi-user editing scenario. Low overhead — just one extra integer column.
+
+---
+
+### 28.6 Pessimistic locking — for high-contention or critical sections
+
+**Pessimistic locking** acquires a database row lock immediately (`SELECT
+... FOR UPDATE`), blocking any other transaction from reading or writing
+the locked rows until the lock is released.
+
+```ruby
+# Lock a single row:
+Issue.transaction do
+  issue = Issue.lock.find(1)
+  # Any other transaction calling Issue.lock.find(1) will wait here
+  issue.update!(status: :closed)
+end  # lock released at COMMIT
+```
+
+**`with_lock` — convenience shorthand**:
+
+```ruby
+issue.with_lock do
+  # issue is reloaded and locked for the duration of this block
+  issue.update!(status: :closed)
+  NotificationJob.perform_later(issue)
+end
+```
+
+**Variants**:
+
+```ruby
+Issue.lock("FOR UPDATE SKIP LOCKED")  # skip rows already locked — for job queues
+Issue.lock("FOR SHARE")               # allow concurrent reads, block writes
+```
+
+| | Optimistic | Pessimistic |
+| --- | --- | --- |
+| **Mechanism** | Version counter checked at write | DB row lock on SELECT |
+| **Contention** | Low — optimistic about conflicts | High — blocks concurrent access |
+| **User experience** | Error shown after the fact | Second user waits (or times out) |
+| **Best for** | Edit forms, APIs | Financial transactions, job dispatch, inventory |
+| **Risk** | Retry logic needed | Deadlocks if locks acquired in inconsistent order |
+
+---
+
+### 28.7 Atomic database operations — counters and `update_all`
+
+For simple numeric updates, skip Ruby entirely — use atomic SQL:
+
+```ruby
+# UNSAFE — read-modify-write in Ruby across two queries
+issue.update!(view_count: issue.view_count + 1)
+
+# SAFE — single atomic SQL UPDATE, no race condition
+Issue.where(id: issue.id).update_all("view_count = view_count + 1")
+
+# Or with ActiveRecord counter cache:
+Issue.increment_counter(:view_count, issue.id)
+```
+
+**Counter caches** — automatically maintained by Rails for `belongs_to`:
+
+```ruby
+class Issue < ApplicationRecord
+  belongs_to :project, counter_cache: true
+end
+# Adds project.issues_count — updated atomically on create/destroy
+```
+
+---
+
+### 28.8 Concurrency in background jobs — Solid Queue & Sidekiq
+
+Solid Queue runs workers as separate processes or threads. Race conditions
+apply equally to jobs. The most common pattern: use `with_lock` at the
+start of a job to ensure only one worker processes a given record:
+
+```ruby
+class CloseIssueJob < ApplicationJob
+  def perform(issue_id)
+    Issue.find(issue_id).with_lock do |issue|
+      return if issue.closed?  # idempotency check inside the lock
+      issue.update!(status: :closed)
+      NotificationMailer.issue_closed(issue).deliver_later
+    end
+  end
+end
+```
+
+This pattern is also called **"check-then-act inside a lock"** — the
+`closed?` check and the update are atomic.
+
+---
+
+### 28.9 Concurrency — Interview Q&A
+
+**Q: How does Puma handle concurrent requests?**
+
+> Puma uses a thread pool (default 5 threads per process) and optionally
+> multiple worker processes. Threads within one process share memory and
+> handle I/O-bound waiting efficiently (a thread blocked on a DB query
+> yields the CPU to another thread). Workers provide full process
+> isolation. The thread count must match the database connection pool size
+> — each thread needs its own connection.
+
+**Q: What makes code thread-unsafe in Rails?**
+
+> Mutable state stored in class variables (`@@var`), global variables, or
+> constants mutated at runtime. These are shared across all threads. Instance
+> variables (`@var`) are safe because each request gets a new controller
+> instance. Rails itself is thread-safe since Rails 4 — the danger is in
+> application code, not the framework.
+
+**Q: What is the difference between optimistic and pessimistic locking?**
+
+> Optimistic locking adds a `lock_version` integer column. Reads are free;
+> writes check that the version hasn't changed since the record was read. If
+> it has, `ActiveRecord::StaleObjectError` is raised and the caller must
+> retry. Pessimistic locking uses `SELECT FOR UPDATE` to hold a DB row lock
+> for the entire transaction duration — other transactions block until it
+> releases. Optimistic is better for low-contention UI forms; pessimistic
+> is better for high-contention financial or inventory operations.
+
+**Q: How do you make a counter increment thread-safe in Rails?**
+
+> Use `update_all("counter = counter + 1")` or `increment_counter` — both
+> translate to a single atomic `UPDATE` SQL statement. The Ruby pattern
+> `record.update!(count: record.count + 1)` is a read-modify-write across
+> two round-trips and is not atomic under concurrent access.
+
+**Q: What is a deadlock and how do you avoid it?**
+
+> A deadlock occurs when transaction A holds lock 1 and waits for lock 2,
+> while transaction B holds lock 2 and waits for lock 1 — neither can
+> proceed. Avoid it by always acquiring locks in the same order across all
+> code paths (e.g. always lock `project` before `issue`, never the
+> reverse), keeping transactions short, and using `SKIP LOCKED` for job
+> queues so workers skip rows already held by another worker.
+
+---
+
+## 29. Authentication & Authorization — Devise, Pundit & the GitLab Model
+
+### 29.1 The difference
+
+| Concept | Question answered | "Who are you?" |
+| --- | --- | --- |
+| **Authentication** | *Who are you?* | Prove identity — login, session, token |
+| **Authorization** | *What are you allowed to do?* | Enforce permissions — roles, policies |
+
+They are entirely separate concerns. A system can identify you perfectly
+(authentication) while giving you access to everything (no authorization).
+Always implement them as separate layers.
+
+---
+
+### 29.2 Authentication strategies
+
+#### Session-based (HTML apps) — Devise
+
+**Devise** is the de-facto Rails authentication gem. It provides:
+
+- Database-backed `User` model with hashed passwords (`bcrypt`)
+- Session cookie management
+- Registration, login, logout, password reset flows
+- Email confirmation, account locking, rememberable ("remember me")
+
+```ruby
+# Gemfile
+gem "devise"
+
+# Terminal
+rails generate devise:install
+rails generate devise User
+rails db:migrate
+```
+
+This generates a `User` model and wires up routes automatically:
+
+```ruby
+# config/routes.rb — added by Devise
+devise_for :users
+# Creates: /users/sign_in, /users/sign_up, /users/password/new, etc.
+```
+
+**Protecting controllers** with Devise:
+
+```ruby
+class ApplicationController < ActionController::Base
+  before_action :authenticate_user!  # Devise helper — redirects to sign_in if not logged in
+end
+
+# Or selectively:
+class IssuesController < ApplicationController
+  before_action :authenticate_user!, except: [:index, :show]
+end
+```
+
+**Accessing the current user** (Devise provides this automatically):
+
+```ruby
+current_user          # => User instance or nil
+user_signed_in?       # => true / false
+```
+
+#### Token-based (JSON APIs) — Bearer tokens
+
+For JSON API clients (mobile apps, third-party integrations), session
+cookies are impractical. Use **Bearer tokens** instead:
+
+```ruby
+# A simple personal access token pattern (no gem needed):
+class ApiToken < ApplicationRecord
+  belongs_to :user
+  before_create { self.token = SecureRandom.hex(32) }
+end
+
+# In ApplicationController (API namespace):
+class Api::V1::ApplicationController < ActionController::API
+  before_action :authenticate_token!
+
+  private
+
+  def authenticate_token!
+    token = request.headers["Authorization"]&.delete_prefix("Bearer ")
+    @current_user = ApiToken.find_by(token: token)&.user
+    render json: { error: "Unauthorized" }, status: :unauthorized unless @current_user
+  end
+end
+```
+
+**JWT (JSON Web Tokens)** — an alternative to DB-stored tokens:
+
+| | DB-stored tokens | JWT |
+| --- | --- | --- |
+| **Revocability** | ✅ Delete the row | ❌ Cannot revoke before expiry |
+| **Stateless** | ❌ Requires DB lookup | ✅ Self-contained |
+| **Rotation** | Simple | Complex |
+| **Recommendation** | Prefer for most apps | Only when truly stateless |
+
+GitLab uses DB-stored personal access tokens, not JWT, for its API.
+JWT's irrevocability is a security liability — if a token is stolen,
+you cannot invalidate it without a blocklist (which defeats the point).
+
+#### HTTP Basic Auth — for internal/admin endpoints
+
+```ruby
+class AdminController < ApplicationController
+  http_basic_authenticate_with name: ENV["ADMIN_USER"], password: ENV["ADMIN_PASSWORD"]
+end
+```
+
+---
+
+### 29.3 Adding authentication to this project
+
+This project currently has no `User` model. Here is the full addition path:
+
+```ruby
+# 1. Gemfile
+gem "devise"
+
+# 2. Terminal
+rails generate devise:install
+rails generate devise User
+rails db:migrate
+
+# 3. Associate issues with their creator
+rails generate migration AddUserToIssues user:references
+rails db:migrate
+```
+
+```ruby
+# 4. app/models/user.rb — generated by Devise
+class User < ApplicationRecord
+  devise :database_authenticatable, :registerable,
+         :recoverable, :rememberable, :validatable
+  has_many :issues, foreign_key: :author_id
+end
+
+# 5. app/models/issue.rb — add the association
+class Issue < ApplicationRecord
+  belongs_to :project
+  belongs_to :author, class_name: "User"
+  # ...
+end
+
+# 6. app/controllers/application_controller.rb
+class ApplicationController < ActionController::Base
+  include Pagy::Backend
+  before_action :authenticate_user!
+end
+
+# 7. app/controllers/issues_controller.rb — set author on create
+def create
+  @issue = @project.issues.new(issue_params)
+  @issue.author = current_user
+  # ...
+end
+```
+
+---
+
+### 29.4 Authorization — Pundit
+
+Once you know *who* the user is, you need to enforce *what they can do*.
+**Pundit** is the standard Rails authorization gem — it uses plain Ruby
+policy objects, one per model.
+
+```ruby
+# Gemfile
+gem "pundit"
+
+# app/controllers/application_controller.rb
+class ApplicationController < ActionController::Base
+  include Pundit::Authorization
+  after_action :verify_authorized, except: :index
+  after_action :verify_policy_scoped, only: :index
+end
+```
+
+`verify_authorized` raises `Pundit::AuthorizationNotPerformedError` if you
+forget to call `authorize` in an action — a safety net that prevents
+accidentally unprotected endpoints.
+
+#### Policy objects
+
+```ruby
+# app/policies/issue_policy.rb
+class IssuePolicy < ApplicationPolicy
+  # attr_reader :user, :record — provided by ApplicationPolicy
+
+  def index?
+    true  # anyone can list issues
+  end
+
+  def show?
+    true  # anyone can view an issue
+  end
+
+  def create?
+    user.present?  # must be logged in
+  end
+
+  def update?
+    user.present? && (record.author == user || user.admin?)
+  end
+
+  def destroy?
+    update?  # same rule as update
+  end
+
+  # Scope — filters which records the user can see
+  class Scope < ApplicationPolicy::Scope
+    def resolve
+      if user&.admin?
+        scope.all
+      elsif user.present?
+        scope.where(project: user.accessible_projects)
+      else
+        scope.none
+      end
+    end
+  end
+end
+```
+
+Pundit's `ApplicationPolicy` base class is generated by:
+
+```bash
+rails generate pundit:install
+```
+
+It gives you `user` (the current user) and `record` (the model instance)
+as instance variables in every policy.
+
+#### Using policies in controllers
+
+```ruby
+class IssuesController < ApplicationController
+  def show
+    authorize @issue        # calls IssuePolicy#show? — raises if denied
+    # ...
+  end
+
+  def update
+    authorize @issue        # calls IssuePolicy#update?
+    @issue.update!(issue_params)
+    # ...
+  end
+
+  def index
+    @issues = policy_scope(@project.issues.with_labels.recent)
+    # calls IssuePolicy::Scope#resolve — returns filtered relation
+    @pagy, @issues = pagy(@issues, limit: 25)
+  end
+
+  def destroy
+    authorize @issue        # calls IssuePolicy#destroy?
+    @issue.destroy!
+    # ...
+  end
+end
+```
+
+If `authorize` fails it raises `Pundit::NotAuthorizedError`. Handle it
+globally:
+
+```ruby
+# app/controllers/application_controller.rb
+rescue_from Pundit::NotAuthorizedError do |e|
+  respond_to do |format|
+    format.html { redirect_to root_path, alert: "You are not authorized to do that." }
+    format.json { render json: { error: "Forbidden" }, status: :forbidden }
+  end
+end
+```
+
+---
+
+### 29.5 Role systems
+
+#### Simple role column
+
+```ruby
+# Migration
+add_column :users, :role, :integer, default: 0, null: false
+
+# Model
+class User < ApplicationRecord
+  enum :role, { viewer: 0, member: 1, maintainer: 2, admin: 3 }
+end
+
+# Policy
+def update?
+  user.admin? || user.maintainer? && record.project.members.include?(user)
+end
+```
+
+#### Resource-scoped roles (GitLab's model)
+
+GitLab uses a **membership** join table — a user's role is scoped per
+project/group, not global:
+
+```ruby
+class Membership < ApplicationRecord
+  belongs_to :user
+  belongs_to :project
+  enum :access_level, { guest: 10, reporter: 20, developer: 30,
+                         maintainer: 40, owner: 50 }
+end
+
+class Project < ApplicationRecord
+  has_many :memberships
+  has_many :members, through: :memberships, source: :user
+end
+
+class User < ApplicationRecord
+  has_many :memberships
+  has_many :projects, through: :memberships
+
+  def role_in(project)
+    memberships.find_by(project: project)&.access_level
+  end
+
+  def can_edit_issues_in?(project)
+    level = role_in(project)
+    Membership.access_levels[level] >= Membership.access_levels["developer"]
+  end
+end
+```
+
+This is the pattern your issue tracker would use if you wanted per-project
+permissions rather than a single global role.
+
+---
+
+### 29.6 Pundit vs CanCanCan
+
+| | **Pundit** | **CanCanCan** |
+| --- | --- | --- |
+| **DSL** | Plain Ruby classes (one per model) | Single `Ability` class with DSL |
+| **Scoping** | Explicit `Scope` inner class | `accessible_by` on AR models |
+| **Testing** | Unit test the policy class directly | Test via controller or unit |
+| **Complexity** | Scales well — policies are isolated | Can become one huge `Ability` file |
+| **GitLab uses** | Custom policy framework inspired by Pundit | — |
+| **Recommended for** | Most new Rails apps | Legacy apps already using it |
+
+GitLab has its own policy framework (`DeclarativePolicy`) built on the same
+concept as Pundit but with explicit dependency graphs between rules, allowing
+it to short-circuit expensive permission checks.
+
+---
+
+### 29.7 Authentication & Authorization — Interview Q&A
+
+**Q: What is the difference between authentication and authorization?**
+
+> Authentication verifies identity — "who are you?" It typically involves
+> a credential (password, token) and produces a session or token that
+> subsequent requests use. Authorization verifies permissions — "are you
+> allowed to do this?" It takes the authenticated identity and checks it
+> against a set of rules. They are separate layers: authenticate first,
+> then authorize each action.
+
+**Q: How does Devise work under the hood?**
+
+> Devise is a Rails Engine composed of modules. `database_authenticatable`
+> stores a `bcrypt`-hashed password in `encrypted_password`. On sign-in,
+> it runs `BCrypt::Password.new(encrypted_password) == submitted_password`
+> (constant-time comparison). On success it writes the user's ID into
+> `session[:user_id]` (via Warden, which Devise sits on top of). Subsequent
+> requests call `current_user` which does `User.find(session[:user_id])`.
+
+**Q: Why does GitLab prefer DB-stored tokens over JWT for its API?**
+
+> JWTs are self-contained and cannot be revoked before their expiry time
+> without maintaining a blocklist — which defeats the statelessness
+> advantage. If a personal access token is stolen, GitLab can delete the
+> row and it is immediately invalid. JWTs require waiting for expiry or
+> implementing a blocklist. For an API that handles production infrastructure,
+> revocability is a hard requirement.
+
+**Q: What does Pundit's `verify_authorized` after_action do?**
+
+> It raises `Pundit::AuthorizationNotPerformedError` if the action
+> completes without having called `authorize`. This is a safety net — any
+> controller action that forgets to authorize will fail loudly rather than
+> silently allowing access. It prevents accidentally unprotected endpoints
+> from reaching production.
+
+**Q: What is the difference between `authorize` and `policy_scope` in Pundit?**
+
+> `authorize(record)` checks a single-record permission — "can this user
+> perform this action on this specific issue?" It raises an error if denied.
+> `policy_scope(relation)` filters a collection — "which of these issues
+> can this user see?" It returns a scoped `ActiveRecord::Relation`. Use
+> `authorize` in `show`, `update`, `destroy`; use `policy_scope` in `index`.
+
+**Q: How would you implement per-project roles like GitLab?**
+
+> Use a `memberships` join table with `user_id`, `project_id`, and an
+> `access_level` integer enum. A user's role is scoped to each project
+> independently. In Pundit policy scopes, filter by
+> `user.memberships.where(access_level: developer_and_above)`. This is
+> more flexible than a global role column because the same user can be a
+> maintainer in one project and a guest in another.
+
+---
