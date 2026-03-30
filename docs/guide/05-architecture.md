@@ -936,7 +936,6 @@ Solid Queue's dispatcher process reads `config/recurring.yml` and enqueues jobs 
 
 ---
 
-
 ## 27. Pagination — Pagy, Offset vs Cursor, and the JSON API Pattern
 
 When a project accumulates thousands of issues, returning all of them in a single query is a reliability hazard: it bloats memory, slows response time, and can time out the request entirely. Pagination is the standard solution. This section covers the strategies, the recommended gem, and the concrete implementation in this project.
